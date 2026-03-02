@@ -1,0 +1,22 @@
+{
+  "name": "@openclaw/relay-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npx tsc -p packages/protocol/tsconfig.json && npx tsc -p packages/server/tsconfig.json && npx tsc -p packages/gateway/tsconfig.json && npx tsc -p apps/relay-server/tsconfig.json",
+    "clean": "rm -rf packages/*/dist apps/*/dist",
+    "typecheck": "tsc --build"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
