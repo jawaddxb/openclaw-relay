@@ -274,6 +274,95 @@ export async function createRelayServer(
     });
   });
 
+  // ── RPC endpoint (app → relay → gateway shell) ─────────────────
+
+  app.post<{
+    Body: { method: string; params?: Record<string, unknown> };
+    Headers: { authorization?: string };
+  }>('/rpc', async (request, reply) => {
+    const auth = request.headers.authorization;
+    if (!auth?.startsWith('Bearer ')) {
+      return reply.status(401).send({ error: 'Missing authorization' });
+    }
+    const token = auth.slice(7);
+    const appInfo = db.validateAppToken(token);
+    if (!appInfo) {
+      return reply.status(401).send({ error: 'Invalid app token' });
+    }
+
+    const { method, params = {} } = request.body ?? {};
+
+    if (method === 'sessions.list') {
+      // Shell out to openclaw status --json to get full sessions list
+      const { exec } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(exec);
+      try {
+        const { stdout } = await execAsync('openclaw status --json', { timeout: 10_000 });
+        const status = JSON.parse(stdout);
+        const recent = (status.sessions?.recent ?? []) as Array<{
+          key: string;
+          agentId: string;
+          sessionId: string;
+          updatedAt: number;
+          kind?: string;
+        }>;
+
+        const limit = (params.limit as number) ?? 50;
+        const activeMinutes = (params.activeMinutes as number) ?? 60;
+        const cutoff = Date.now() - activeMinutes * 60 * 1000;
+
+        const sessions = recent
+          .filter((s) => !activeMinutes || s.updatedAt > cutoff)
+          .slice(0, limit)
+          .map((s) => {
+            const parts = s.key.split(':');
+            // key format: agent:<agentId>:<channel>:<kind>:<target>
+            const channel = parts[2] ?? 'unknown';
+            const kind = parts[3] ?? 'direct';
+            const target = parts[4] ?? '';
+            return {
+              key: s.key,
+              agentId: s.agentId,
+              sessionId: s.sessionId,
+              channel,
+              kind,
+              target,
+              updatedAt: s.updatedAt,
+            };
+          });
+
+        return reply.send({ result: { sessions, count: sessions.length } });
+      } catch (err) {
+        return reply.status(500).send({ error: { message: String(err) } });
+      }
+    }
+
+    if (method === 'gateway.status') {
+      const { exec } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(exec);
+      try {
+        const { stdout } = await execAsync('openclaw status --json', { timeout: 10_000 });
+        const status = JSON.parse(stdout);
+        return reply.send({
+          result: {
+            channels: status.channels ?? {},
+            sessions: { count: status.sessions?.count ?? 0 },
+            agents: (status.agents ?? []).map((a: { agentId: string; model?: string }) => ({
+              agentId: a.agentId,
+              model: a.model,
+            })),
+          },
+        });
+      } catch (err) {
+        return reply.status(500).send({ error: { message: String(err) } });
+      }
+    }
+
+    return reply.status(400).send({ error: 'Unknown RPC method' });
+  });
+
   // ── Admin / utility endpoints ──────────────────────────────────
 
   app.get('/api/health', async () => {
