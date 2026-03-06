@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { createServer } from 'node:http';
 import { Command } from 'commander';
 import { GatewayClient } from './client.js';
+import { callOpenClawRpc, getOpenClawAgents } from './openclaw-rpc.js';
 
 const program = new Command();
 
@@ -17,17 +19,79 @@ program
   .requiredOption('--upstream <url>', 'Local HTTP server to tunnel to')
   .option('--relay <url>', 'Relay WebSocket URL', 'ws://localhost:8080/v1/tunnel')
   .option('--name <name>', 'Gateway display name')
+  .option('--openclaw-token <token>', 'OpenClaw gateway token for RPC sidecar')
+  .option('--sidecar-port <port>', 'Port for JSON sidecar server', '18790')
   .action(async (opts) => {
+    const upstreamUrl = opts.upstream as string;
+    const sidecarPort = parseInt(opts.sidecarPort, 10);
+
+    // Build WS URL for OpenClaw RPC (same host as upstream, ws:// protocol)
+    const ocWsUrl = upstreamUrl.replace(/^http/, 'ws');
+    const ocToken = opts.openclawToken as string | undefined;
+
+    // Start a JSON sidecar HTTP server that translates REST → OpenClaw WS RPC
+    const sidecar = createServer(async (req, res) => {
+      const url = req.url ?? '/';
+      res.setHeader('Content-Type', 'application/json');
+
+      try {
+        if (url === '/api/agents' || url.startsWith('/api/agents?')) {
+          if (!ocToken) { res.end(JSON.stringify([])); return; }
+          const agents = await getOpenClawAgents(ocWsUrl, ocToken);
+          res.end(JSON.stringify(agents));
+          return;
+        }
+
+        if (url === '/api/sessions' || url.startsWith('/api/sessions?')) {
+          if (!ocToken) { res.end(JSON.stringify({ sessions: [] })); return; }
+          const status = await callOpenClawRpc<{ sessions?: { paths?: string[] } }>(
+            ocWsUrl, ocToken, 'status',
+          );
+          const paths = status.sessions?.paths ?? [];
+          const sessions = paths.map((p) => {
+            const parts = p.split('/');
+            const key = parts[parts.length - 1] ?? p;
+            const [agentId, ...rest] = key.split(':');
+            return { key, agentId: agentId ?? 'main', threadId: rest.join(':') || key, createdAt: new Date().toISOString(), lastActivity: new Date().toISOString(), messageCount: 0 };
+          });
+          res.end(JSON.stringify({ sessions }));
+          return;
+        }
+
+        if (url === '/api/health') {
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        // Everything else: proxy to upstream as-is
+        const proxyRes = await fetch(`${upstreamUrl}${url}`, {
+          method: req.method,
+          headers: Object.fromEntries(
+            Object.entries(req.headers).filter(([, v]) => typeof v === 'string') as [string, string][]
+          ),
+        });
+        res.statusCode = proxyRes.status;
+        const text = await proxyRes.text();
+        res.end(text);
+      } catch (e) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'unknown' }));
+      }
+    });
+
+    await new Promise<void>((resolve) => sidecar.listen(sidecarPort, '127.0.0.1', resolve));
+    console.log(`  Sidecar running on http://127.0.0.1:${sidecarPort}`);
+
     const client = new GatewayClient({
       relayUrl: opts.relay,
       token: opts.token,
-      upstream: opts.upstream,
+      upstream: `http://127.0.0.1:${sidecarPort}`,
       gatewayName: opts.name,
     });
 
     client.on('connected', ({ gatewayId }) => {
       console.log(`\n  Connected to relay as gateway: ${gatewayId}`);
-      console.log(`  Forwarding to: ${opts.upstream}`);
+      console.log(`  Forwarding to: ${upstreamUrl} (via sidecar)`);
       console.log(`  Press Ctrl+C to disconnect.\n`);
     });
 
