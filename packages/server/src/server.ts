@@ -161,10 +161,14 @@ export async function createRelayServer(
               // Write headers immediately when head arrives, BEFORE any data frames
               if (!headersWritten) {
                 headersWritten = true;
+                const origin = request.headers.origin || '*';
                 reply.raw.writeHead(head.status, {
                   ...head.headers,
                   'cache-control': 'no-cache',
                   connection: 'keep-alive',
+                  'access-control-allow-origin': origin,
+                  'access-control-allow-credentials': 'true',
+                  'access-control-expose-headers': 'x-relay-app-id',
                 });
               }
             },
