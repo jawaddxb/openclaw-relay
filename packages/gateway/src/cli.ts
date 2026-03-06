@@ -1,9 +1,97 @@
 #!/usr/bin/env node
 
 import { createServer } from 'node:http';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { resolve, join, extname, normalize, sep, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { Command } from 'commander';
 import { GatewayClient } from './client.js';
 import { callOpenClawRpc, getOpenClawAgents } from './openclaw-rpc.js';
+
+// ── Workspace file serving ────────────────────────────────────
+const WORKSPACE_DIR = resolve(homedir(), '.openclaw', 'workspace');
+
+function isPathSafe(filePath: string): boolean {
+  const resolved = resolve(filePath);
+  return resolved.startsWith(WORKSPACE_DIR + sep) || resolved === WORKSPACE_DIR;
+}
+
+function serveWorkspace(url: string): { status: number; headers: Record<string, string>; body: string } | null {
+  const parsed = new URL(url, 'http://localhost');
+  const pathname = parsed.pathname;
+
+  // Directory listing: /api/workspace/?dir=memory
+  if (pathname === '/api/workspace/' || pathname === '/api/workspace') {
+    const dirParam = parsed.searchParams.get('dir');
+    const safeDirName = dirParam ? normalize(dirParam).replace(/^(\.\.[\\/])+/, '') : '';
+    const dirPath = safeDirName ? join(WORKSPACE_DIR, safeDirName) : WORKSPACE_DIR;
+
+    if (!isPathSafe(dirPath)) {
+      return { status: 403, headers: {}, body: JSON.stringify({ error: 'Path traversal blocked' }) };
+    }
+
+    try {
+      const entries = readdirSync(dirPath, { withFileTypes: true });
+      const files = entries
+        .filter((e: any) => !e.name.startsWith('.'))
+        .map((e: any) => ({
+          name: e.name,
+          type: e.isDirectory() ? 'directory' : 'file',
+          ext: extname(e.name).slice(1).toLowerCase(),
+        }));
+      return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(files) };
+    } catch {
+      return { status: 404, headers: {}, body: JSON.stringify({ error: 'Directory not found' }) };
+    }
+  }
+
+  // File serving: /api/workspace/<path>
+  const match = pathname.match(/^\/api\/workspace\/(.+?)$/);
+  if (!match) return null;
+
+  const rawPath = decodeURIComponent(match[1]);
+  const filePath = resolve(WORKSPACE_DIR, rawPath);
+
+  if (!isPathSafe(filePath)) {
+    return { status: 403, headers: {}, body: JSON.stringify({ error: 'Path traversal blocked' }) };
+  }
+
+  try {
+    const stat = statSync(filePath);
+    if (stat.isDirectory()) {
+      const entries = readdirSync(filePath, { withFileTypes: true });
+      const files = entries
+        .filter((e: any) => !e.name.startsWith('.'))
+        .map((e: any) => ({
+          name: e.name,
+          type: e.isDirectory() ? 'directory' : 'file',
+          ext: extname(e.name).slice(1).toLowerCase(),
+        }));
+      return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(files) };
+    }
+
+    const ext = extname(filePath).toLowerCase();
+    const textExts = new Set(['.md', '.txt', '.json', '.ts', '.tsx', '.js', '.jsx', '.py', '.sh', '.yml', '.yaml', '.toml', '.csv', '.html', '.css', '.env']);
+
+    if (textExts.has(ext)) {
+      const content = readFileSync(filePath, 'utf8');
+      const ct = ext === '.json' ? 'application/json' : 'text/plain; charset=utf-8';
+      return { status: 200, headers: { 'content-type': ct }, body: content };
+    }
+
+    // Binary files: base64
+    const content = readFileSync(filePath).toString('base64');
+    const mimeTypes: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.pdf': 'application/pdf',
+      '.apk': 'application/vnd.android.package-archive',
+    };
+    const ct = mimeTypes[ext] || 'application/octet-stream';
+    return { status: 200, headers: { 'content-type': ct, 'x-encoding': 'base64' }, body: content };
+  } catch {
+    return { status: 404, headers: {}, body: `File not found: ${rawPath}` };
+  }
+}
 
 const program = new Command();
 
@@ -35,6 +123,19 @@ program
       res.setHeader('Content-Type', 'application/json');
 
       try {
+        // Workspace file serving (intercepted locally, never forwarded)
+        if (req.method === 'GET' && url.startsWith('/api/workspace')) {
+          const result = serveWorkspace(url);
+          if (result) {
+            res.statusCode = result.status;
+            for (const [k, v] of Object.entries(result.headers)) {
+              res.setHeader(k, v);
+            }
+            res.end(result.body);
+            return;
+          }
+        }
+
         if (url === '/api/agents' || url.startsWith('/api/agents?')) {
           if (!ocToken) { res.end(JSON.stringify([])); return; }
           const agents = await getOpenClawAgents(ocWsUrl, ocToken);
