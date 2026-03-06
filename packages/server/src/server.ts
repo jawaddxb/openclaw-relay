@@ -204,6 +204,76 @@ export async function createRelayServer(
     }
   });
 
+  // ── Real-time event stream (SSE) ────────────────────────────────
+
+  const sseClients = new Set<{ res: import('http').ServerResponse; gatewayId: string }>();
+
+  function broadcastEvent(gatewayId: string, event: string, data: unknown) {
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const client of sseClients) {
+      if (client.gatewayId === gatewayId) {
+        try { client.res.write(payload); } catch { sseClients.delete(client); }
+      }
+    }
+  }
+
+  // Emit events from hub to SSE clients
+  hub.on('request', (info: { gatewayId: string; method: string; path: string }) => {
+    broadcastEvent(info.gatewayId, 'request', {
+      method: info.method,
+      path: info.path,
+      timestamp: Date.now(),
+    });
+  });
+
+  hub.on('gateway:connected', (info: { id: string; name: string }) => {
+    broadcastEvent(info.id, 'gateway:status', { connected: true, name: info.name });
+  });
+
+  hub.on('gateway:disconnected', (info: { id: string; reason: string }) => {
+    broadcastEvent(info.id, 'gateway:status', { connected: false, reason: info.reason });
+  });
+
+  app.get<{
+    Headers: { authorization?: string };
+  }>('/api/events', async (request, reply) => {
+    const auth = request.headers.authorization;
+    if (!auth?.startsWith('Bearer ')) {
+      return reply.status(401).send({ error: 'Missing authorization' });
+    }
+
+    const token = auth.slice(7);
+    const appInfo = db.validateAppToken(token);
+    if (!appInfo) {
+      return reply.status(401).send({ error: 'Invalid app token' });
+    }
+
+    const origin = request.headers.origin || '*';
+    reply.raw.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'access-control-allow-origin': origin,
+      'access-control-allow-credentials': 'true',
+    });
+
+    // Send initial connection event
+    reply.raw.write(`event: connected\ndata: ${JSON.stringify({ gatewayId: appInfo.gatewayId })}\n\n`);
+
+    const client = { res: reply.raw, gatewayId: appInfo.gatewayId };
+    sseClients.add(client);
+
+    // Keepalive ping every 15s
+    const keepalive = setInterval(() => {
+      try { reply.raw.write(': keepalive\n\n'); } catch { /* ignore */ }
+    }, 15_000);
+
+    request.raw.on('close', () => {
+      clearInterval(keepalive);
+      sseClients.delete(client);
+    });
+  });
+
   // ── Admin / utility endpoints ──────────────────────────────────
 
   app.get('/api/health', async () => {
