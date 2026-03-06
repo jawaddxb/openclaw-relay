@@ -292,69 +292,67 @@ export async function createRelayServer(
 
     const { method, params = {} } = request.body ?? {};
 
+    if (!hub.isGatewayConnected(appInfo.gatewayId)) {
+      return reply.status(502).send({ error: { message: 'Gateway is not connected' } });
+    }
+
     if (method === 'sessions.list') {
-      // Shell out to openclaw status --json to get full sessions list
-      const { exec } = await import('child_process');
-      const { promisify } = await import('util');
-      const execAsync = promisify(exec);
+      // Forward sessions_list tool call through the tunnel to the gateway
+      // Use activeMinutes param to widen the scope
+      const limit = (params.limit as number) ?? 100;
+      const activeMinutes = (params.activeMinutes as number) ?? 1440;
       try {
-        const { stdout } = await execAsync('openclaw status --json', { timeout: 10_000 });
-        const status = JSON.parse(stdout);
-        const recent = (status.sessions?.recent ?? []) as Array<{
-          key: string;
-          agentId: string;
-          sessionId: string;
-          updatedAt: number;
-          kind?: string;
-        }>;
-
-        const limit = (params.limit as number) ?? 50;
-        const activeMinutes = (params.activeMinutes as number) ?? 60;
-        const cutoff = Date.now() - activeMinutes * 60 * 1000;
-
-        const sessions = recent
-          .filter((s) => !activeMinutes || s.updatedAt > cutoff)
-          .slice(0, limit)
-          .map((s) => {
-            const parts = s.key.split(':');
-            // key format: agent:<agentId>:<channel>:<kind>:<target>
-            const channel = parts[2] ?? 'unknown';
-            const kind = parts[3] ?? 'direct';
-            const target = parts[4] ?? '';
-            return {
-              key: s.key,
-              agentId: s.agentId,
-              sessionId: s.sessionId,
-              channel,
-              kind,
-              target,
-              updatedAt: s.updatedAt,
-            };
-          });
-
-        return reply.send({ result: { sessions, count: sessions.length } });
+        const response = await hub.forwardRequest(appInfo.gatewayId, {
+          method: 'POST',
+          path: '/tools/invoke',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            tool: 'sessions_list',
+            args: { limit, activeMinutes },
+          }),
+        });
+        const text = response.body.toString('utf8');
+        const json = JSON.parse(text);
+        // Parse tool response — content[0].text has the JSON
+        const content = json.result?.content ?? json.content ?? [];
+        let sessions: unknown[] = [];
+        if (content[0]?.text) {
+          const parsed = JSON.parse(content[0].text);
+          sessions = parsed.sessions ?? parsed.details?.sessions ?? [];
+        }
+        // Enrich with channel info from session key
+        const enriched = (sessions as Array<Record<string, unknown>>).map((s) => {
+          const key = (s.key || s.sessionKey || '') as string;
+          const parts = key.split(':');
+          return {
+            ...s,
+            key,
+            agentId: s.agentId || parts[1] || 'main',
+            channel: s.channel || parts[2] || 'unknown',
+            kind: s.kind || parts[3] || 'direct',
+            target: s.target || parts[4] || '',
+          };
+        });
+        return reply.send({ result: { sessions: enriched, count: enriched.length } });
       } catch (err) {
         return reply.status(500).send({ error: { message: String(err) } });
       }
     }
 
     if (method === 'gateway.status') {
-      const { exec } = await import('child_process');
-      const { promisify } = await import('util');
-      const execAsync = promisify(exec);
       try {
-        const { stdout } = await execAsync('openclaw status --json', { timeout: 10_000 });
-        const status = JSON.parse(stdout);
-        return reply.send({
-          result: {
-            channels: status.channels ?? {},
-            sessions: { count: status.sessions?.count ?? 0 },
-            agents: (status.agents ?? []).map((a: { agentId: string; model?: string }) => ({
-              agentId: a.agentId,
-              model: a.model,
-            })),
-          },
+        const response = await hub.forwardRequest(appInfo.gatewayId, {
+          method: 'GET',
+          path: '/status',
+          headers: {},
+          body: '',
         });
+        const text = response.body.toString('utf8');
+        try {
+          return reply.send({ result: JSON.parse(text) });
+        } catch {
+          return reply.send({ result: { raw: text } });
+        }
       } catch (err) {
         return reply.status(500).send({ error: { message: String(err) } });
       }
