@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
+import fastifyCors from '@fastify/cors';
 import type { FastifyInstance } from 'fastify';
 import { WebSocketHub } from './hub.js';
 import { RelayDB } from './db.js';
@@ -33,6 +34,13 @@ export async function createRelayServer(
   const hub = new WebSocketHub(heartbeatMs);
 
   const app = Fastify({ logger: true });
+  await app.register(fastifyCors, {
+    origin: true, // Allow all origins (app runs on any domain/localhost)
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-openclaw-agent-id', 'x-openclaw-session-key'],
+    exposedHeaders: ['x-relay-app-id'],
+    credentials: true,
+  });
   await app.register(fastifyWebsocket);
 
   // ── WebSocket tunnel endpoint ──────────────────────────────────
