@@ -164,16 +164,70 @@ program
           return;
         }
 
-        // Everything else: proxy to upstream as-is
+        // Everything else: proxy to upstream with gateway auth
+        const proxyHeaders = Object.fromEntries(
+          Object.entries(req.headers).filter(([, v]) => typeof v === 'string') as [string, string][]
+        );
+        // Inject gateway auth token for the upstream OpenClaw gateway
+        if (ocToken) {
+          proxyHeaders['authorization'] = `Bearer ${ocToken}`;
+        }
+        delete proxyHeaders['host'];
+        delete proxyHeaders['connection'];
+
+        // Collect body for non-GET requests
+        let reqBody: string | undefined;
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          reqBody = await new Promise<string>((resolve) => {
+            let body = '';
+            req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+            req.on('end', () => resolve(body));
+          });
+        }
+
         const proxyRes = await fetch(`${upstreamUrl}${url}`, {
           method: req.method,
-          headers: Object.fromEntries(
-            Object.entries(req.headers).filter(([, v]) => typeof v === 'string') as [string, string][]
-          ),
+          headers: proxyHeaders,
+          ...(reqBody ? { body: reqBody } : {}),
         });
+
         res.statusCode = proxyRes.status;
-        const text = await proxyRes.text();
-        res.end(text);
+
+        // Check if this is an SSE stream — pipe it instead of buffering
+        const ct = proxyRes.headers.get('content-type') || '';
+        const isSSE = ct.includes('text/event-stream');
+        const acceptsSSE = (req.headers.accept || '').includes('text/event-stream');
+
+        if ((isSSE || acceptsSSE) && proxyRes.body) {
+          // Pipe SSE stream through
+          for (const [k, v] of proxyRes.headers.entries()) {
+            if (k !== 'transfer-encoding') res.setHeader(k, v);
+          }
+          res.setHeader('cache-control', 'no-cache');
+          res.setHeader('connection', 'keep-alive');
+          res.flushHeaders();
+
+          const reader = (proxyRes.body as any).getReader();
+          const decoder = new TextDecoder();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(decoder.decode(value, { stream: true }));
+            }
+          } catch {
+            // Client disconnected
+          } finally {
+            res.end();
+          }
+        } else {
+          // Buffer normal responses
+          for (const [k, v] of proxyRes.headers.entries()) {
+            if (k !== 'transfer-encoding') res.setHeader(k, v);
+          }
+          const text = await proxyRes.text();
+          res.end(text);
+        }
       } catch (e) {
         res.statusCode = 500;
         res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'unknown' }));
@@ -187,6 +241,7 @@ program
       relayUrl: opts.relay,
       token: opts.token,
       upstream: `http://127.0.0.1:${sidecarPort}`,
+      upstreamToken: ocToken, // Inject OpenClaw gateway auth on tunneled requests
       gatewayName: opts.name,
     });
 

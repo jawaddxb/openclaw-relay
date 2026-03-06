@@ -27,6 +27,8 @@ export interface GatewayClientOptions {
   relayUrl: string;
   token: string;
   upstream?: string;
+  /** Auth token to inject when forwarding requests to upstream */
+  upstreamToken?: string;
   gatewayName?: string;
   reconnect?: boolean;
   reconnectDelay?: { min: number; max: number };
@@ -210,6 +212,12 @@ export class GatewayClient extends EventEmitter {
     try {
       const url = new URL(request.path, this.options.upstream);
       const fetchHeaders: Record<string, string> = { ...request.headers };
+      // Inject upstream auth token (e.g. OpenClaw gateway token)
+      if (this.options.upstreamToken) {
+        fetchHeaders['authorization'] = `Bearer ${this.options.upstreamToken}`;
+      }
+      delete fetchHeaders['host'];
+      delete fetchHeaders['connection'];
 
       const res = await fetch(url.toString(), {
         method: request.method,
