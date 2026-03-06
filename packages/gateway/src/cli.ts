@@ -144,18 +144,51 @@ program
         }
 
         if (url === '/api/sessions' || url.startsWith('/api/sessions?')) {
-          if (!ocToken) { res.end(JSON.stringify({ sessions: [] })); return; }
-          const status = await callOpenClawRpc<{ sessions?: { paths?: string[] } }>(
-            ocWsUrl, ocToken, 'status',
-          );
-          const paths = status.sessions?.paths ?? [];
-          const sessions = paths.map((p) => {
-            const parts = p.split('/');
-            const key = parts[parts.length - 1] ?? p;
-            const [agentId, ...rest] = key.split(':');
-            return { key, agentId: agentId ?? 'main', threadId: rest.join(':') || key, createdAt: new Date().toISOString(), lastActivity: new Date().toISOString(), messageCount: 0 };
-          });
-          res.end(JSON.stringify({ sessions }));
+          try {
+            const { readFileSync, readdirSync, existsSync } = await import('fs');
+            const { join } = await import('path');
+            const homeDir = process.env.HOME || '/root';
+            const agentsDir = join(homeDir, '.openclaw', 'agents');
+            const allSessions: Array<Record<string, unknown>> = [];
+
+            // Scan all agent session files directly from filesystem
+            if (existsSync(agentsDir)) {
+              for (const agentId of readdirSync(agentsDir)) {
+                const sessFile = join(agentsDir, agentId, 'sessions', 'sessions.json');
+                try {
+                  if (!existsSync(sessFile)) continue;
+                  const raw = readFileSync(sessFile, 'utf8');
+                  const entries = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+                  for (const [key, value] of Object.entries(entries)) {
+                    const parts = key.split(':');
+                    allSessions.push({
+                      key,
+                      agentId: parts[1] || agentId,
+                      channel: (value as Record<string, unknown>).channel as string
+                        || (value as Record<string, unknown>).lastChannel as string
+                        || parts[2] || 'unknown',
+                      kind: parts[3] || 'direct',
+                      target: parts.slice(4).join(':') || '',
+                      sessionId: (value as Record<string, unknown>).sessionId,
+                      updatedAt: (value as Record<string, unknown>).updatedAt,
+                      displayName: (value as Record<string, unknown>).displayName,
+                      model: (value as Record<string, unknown>).model,
+                      totalTokens: (value as Record<string, unknown>).totalTokens,
+                      chatType: (value as Record<string, unknown>).chatType,
+                    });
+                  }
+                } catch { /* file not readable */ }
+              }
+            }
+
+            // Sort by updatedAt descending
+            allSessions.sort((a, b) => ((b.updatedAt as number) || 0) - ((a.updatedAt as number) || 0));
+
+            res.end(JSON.stringify({ sessions: allSessions, count: allSessions.length }));
+          } catch (e) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'unknown', sessions: [] }));
+          }
           return;
         }
 
