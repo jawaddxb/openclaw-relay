@@ -146,7 +146,8 @@ export async function createRelayServer(
     if (isSSE) {
       // SSE streaming response
       try {
-        const response = await hub.forwardRequest(
+        let headersWritten = false;
+        await hub.forwardRequest(
           appInfo.gatewayId,
           {
             method: request.method,
@@ -156,6 +157,17 @@ export async function createRelayServer(
               request.body != null ? JSON.stringify(request.body) : undefined,
           },
           {
+            onHead: (head) => {
+              // Write headers immediately when head arrives, BEFORE any data frames
+              if (!headersWritten) {
+                headersWritten = true;
+                reply.raw.writeHead(head.status, {
+                  ...head.headers,
+                  'cache-control': 'no-cache',
+                  connection: 'keep-alive',
+                });
+              }
+            },
             onStreamData: (data) => {
               reply.raw.write(data);
             },
@@ -164,12 +176,6 @@ export async function createRelayServer(
             },
           },
         );
-
-        reply.raw.writeHead(response.status, {
-          ...response.headers,
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        });
       } catch (err) {
         const message =
           err instanceof Error ? err.message : 'Unknown error';
