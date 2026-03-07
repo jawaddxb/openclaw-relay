@@ -222,7 +222,7 @@ export class GatewayClient extends EventEmitter {
       const res = await fetch(url.toString(), {
         method: request.method,
         headers: fetchHeaders,
-        body: request.body ?? undefined,
+        body: request.method === 'GET' || request.method === 'HEAD' ? undefined : (request.body ?? undefined),
       });
 
       const resHeaders: Record<string, string> = {};

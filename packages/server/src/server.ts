@@ -260,6 +260,10 @@ export async function createRelayServer(
     // Send initial connection event
     reply.raw.write(`event: connected\ndata: ${JSON.stringify({ gatewayId: appInfo.gatewayId })}\n\n`);
 
+    // Send current gateway status immediately so the client doesn't stay in "Checking..."
+    const isGwConnected = hub.isGatewayConnected(appInfo.gatewayId);
+    reply.raw.write(`event: gateway:status\ndata: ${JSON.stringify({ connected: isGwConnected })}\n\n`);
+
     const client = { res: reply.raw, gatewayId: appInfo.gatewayId };
     sseClients.add(client);
 
@@ -345,7 +349,6 @@ export async function createRelayServer(
           method: 'GET',
           path: '/status',
           headers: {},
-          body: '',
         });
         const text = response.body.toString('utf8');
         try {
