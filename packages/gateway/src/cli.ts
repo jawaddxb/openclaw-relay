@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from 'node:http';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'node:fs';
 import { resolve, join, extname, normalize, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { Command } from 'commander';
@@ -10,6 +10,38 @@ import { callOpenClawRpc, getOpenClawAgents } from './openclaw-rpc.js';
 
 // ── Workspace file serving ────────────────────────────────────
 const WORKSPACE_DIR = resolve(homedir(), '.openclaw', 'workspace');
+const AGENTS_DIR = resolve(homedir(), '.openclaw', 'agents');
+const MEMORY_DIR = resolve(homedir(), '.openclaw', 'workspace', 'memory');
+const BRIEFINGS_DIR = join(MEMORY_DIR, 'briefings');
+const RETROS_DIR = join(MEMORY_DIR, 'retros');
+const SKILLS_GLOBAL_DIR = '/opt/homebrew/lib/node_modules/openclaw/skills';
+
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+function jsonRes(res: ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(data));
+}
+
+function appendJsonl(filePath: string, obj: unknown): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  appendFileSync(filePath, JSON.stringify(obj) + '\n');
+}
+
+function readJsonl(filePath: string): unknown[] {
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    return raw.split('\n').map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(x => x !== null);
+  } catch { return []; }
+}
+
+function collectBody(req: IncomingMessage): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let body = '';
+    req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+    req.on('end', () => resolve(body));
+  });
+}
 
 function isPathSafe(filePath: string): boolean {
   const resolved = resolve(filePath);
@@ -121,8 +153,21 @@ program
     const sidecar = createServer(async (req, res) => {
       const url = req.url ?? '/';
       res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Access-Control-Allow-Origin', '*');
 
       try {
+        // CORS preflight
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '86400',
+          });
+          res.end();
+          return;
+        }
+
         // Workspace file serving (intercepted locally, never forwarded)
         if (req.method === 'GET' && url.startsWith('/api/workspace')) {
           const result = serveWorkspace(url);
@@ -143,7 +188,7 @@ program
           return;
         }
 
-        if (url === '/api/sessions' || url.startsWith('/api/sessions?')) {
+        if ((url === '/api/sessions' || url.startsWith('/api/sessions?')) && !url.startsWith('/api/sessions/')) {
           try {
             const { readFileSync, readdirSync, existsSync } = await import('fs');
             const { join } = await import('path');
@@ -193,7 +238,292 @@ program
         }
 
         if (url === '/api/health') {
-          res.end(JSON.stringify({ ok: true }));
+          jsonRes(res, 200, { ok: true });
+          return;
+        }
+
+        // ── GET /api/usage ────────────────────────────────────
+        if (req.method === 'GET' && url === '/api/usage') {
+          const MODEL_RATES: Record<string, { input: number; output: number }> = {
+            opus: { input: 15, output: 75 },
+            sonnet: { input: 3, output: 15 },
+            'gpt-4o': { input: 5, output: 15 },
+          };
+          const DEFAULT_RATE = { input: 3, output: 15 };
+
+          const sessFile = join(AGENTS_DIR, 'main', 'sessions', 'sessions.json');
+          let sessions: Record<string, Record<string, unknown>> = {};
+          try { sessions = JSON.parse(readFileSync(sessFile, 'utf8')); } catch { /* empty */ }
+
+          const now = new Date();
+          const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+          const weekStart = todayStart - (now.getDay() * 86400000);
+          const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+          const periods = { today: { tokens: 0, cost: 0 }, week: { tokens: 0, cost: 0 }, month: { tokens: 0, cost: 0 }, allTime: { tokens: 0, cost: 0 } };
+          const byModel: Record<string, { tokens: number; cost: number; sessions: number }> = {};
+
+          for (const sess of Object.values(sessions)) {
+            const updatedAt = (sess.updatedAt as number) || 0;
+            const inputTokens = (sess.inputTokens as number) || 0;
+            const outputTokens = (sess.outputTokens as number) || 0;
+            const totalTokens = inputTokens + outputTokens;
+            const modelStr = ((sess.model as string) || 'unknown').toLowerCase();
+
+            let rateKey = Object.keys(MODEL_RATES).find(k => modelStr.includes(k));
+            const rate = rateKey ? MODEL_RATES[rateKey] : DEFAULT_RATE;
+            const cost = (inputTokens / 1_000_000) * rate.input + (outputTokens / 1_000_000) * rate.output;
+
+            const modelName = (sess.model as string) || 'unknown';
+            if (!byModel[modelName]) byModel[modelName] = { tokens: 0, cost: 0, sessions: 0 };
+            byModel[modelName].tokens += totalTokens;
+            byModel[modelName].cost += cost;
+            byModel[modelName].sessions += 1;
+
+            periods.allTime.tokens += totalTokens;
+            periods.allTime.cost += cost;
+            if (updatedAt >= monthStart) { periods.month.tokens += totalTokens; periods.month.cost += cost; }
+            if (updatedAt >= weekStart) { periods.week.tokens += totalTokens; periods.week.cost += cost; }
+            if (updatedAt >= todayStart) { periods.today.tokens += totalTokens; periods.today.cost += cost; }
+          }
+
+          // Round costs
+          for (const p of Object.values(periods)) { p.cost = Math.round(p.cost * 100) / 100; }
+          for (const m of Object.values(byModel)) { m.cost = Math.round(m.cost * 100) / 100; }
+
+          jsonRes(res, 200, { ...periods, byModel });
+          return;
+        }
+
+        // ── GET/POST /api/missions ────────────────────────────
+        const parsedUrl = new URL(url, 'http://localhost');
+        const pathname = parsedUrl.pathname;
+
+        if (pathname === '/api/missions') {
+          const missionsFile = join(MEMORY_DIR, 'missions.jsonl');
+          if (req.method === 'GET') {
+            const limit = parseInt(parsedUrl.searchParams.get('limit') || '50', 10);
+            const all = readJsonl(missionsFile);
+            const missions = all.slice(-limit).reverse();
+            jsonRes(res, 200, { missions, total: all.length });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await collectBody(req);
+            const obj = JSON.parse(body);
+            appendJsonl(missionsFile, obj);
+            jsonRes(res, 200, { ok: true });
+            return;
+          }
+        }
+
+        // ── GET/POST /api/outputs ─────────────────────────────
+        if (pathname === '/api/outputs') {
+          const outputsFile = join(MEMORY_DIR, 'outputs.jsonl');
+          if (req.method === 'GET') {
+            const limit = parseInt(parsedUrl.searchParams.get('limit') || '50', 10);
+            const all = readJsonl(outputsFile);
+            const outputs = all.slice(-limit).reverse();
+            jsonRes(res, 200, { outputs, total: all.length });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await collectBody(req);
+            const obj = JSON.parse(body);
+            appendJsonl(outputsFile, obj);
+            jsonRes(res, 200, { ok: true });
+            return;
+          }
+        }
+
+        // ── GET/POST /api/briefings, GET /api/briefings/:filename ──
+        if (pathname === '/api/briefings') {
+          if (req.method === 'GET') {
+            mkdirSync(BRIEFINGS_DIR, { recursive: true });
+            const files = readdirSync(BRIEFINGS_DIR).filter(f => f.endsWith('.md'));
+            const result = files.map(filename => {
+              const fp = join(BRIEFINGS_DIR, filename);
+              const content = readFileSync(fp, 'utf8');
+              const lines = content.split('\n').slice(0, 5);
+              const titleLine = lines.find(l => l.startsWith('# '));
+              const title = titleLine ? titleLine.replace(/^#\s+/, '') : filename;
+              const tagsLine = lines.find(l => l.startsWith('Tags:'));
+              const tags = tagsLine ? tagsLine.replace(/^Tags:\s*/, '').split(',').map(t => t.trim()) : [];
+              const st = statSync(fp);
+              const date = filename.replace(/\.md$/, '');
+              return { filename, title, date, tags, size: st.size };
+            });
+            jsonRes(res, 200, result);
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await collectBody(req);
+            const { filename, content } = JSON.parse(body);
+            mkdirSync(BRIEFINGS_DIR, { recursive: true });
+            const safeName = normalize(filename).replace(/^(\.\.[\\/])+/, '');
+            writeFileSync(join(BRIEFINGS_DIR, safeName), content);
+            jsonRes(res, 200, { ok: true });
+            return;
+          }
+        }
+
+        if (pathname.startsWith('/api/briefings/') && req.method === 'GET') {
+          const filename = decodeURIComponent(pathname.replace('/api/briefings/', ''));
+          const fp = resolve(BRIEFINGS_DIR, filename);
+          if (!fp.startsWith(BRIEFINGS_DIR + sep) && fp !== BRIEFINGS_DIR) {
+            jsonRes(res, 403, { error: 'Path traversal blocked' });
+            return;
+          }
+          try {
+            const content = readFileSync(fp, 'utf8');
+            jsonRes(res, 200, { filename, content });
+          } catch { jsonRes(res, 404, { error: 'Not found' }); }
+          return;
+        }
+
+        // ── GET /api/retros, GET /api/retros/:filename ────────
+        if (pathname === '/api/retros' && req.method === 'GET') {
+          mkdirSync(RETROS_DIR, { recursive: true });
+          const files = readdirSync(RETROS_DIR).filter(f => f.endsWith('.md'));
+          const result = files.map(filename => {
+            const fp = join(RETROS_DIR, filename);
+            const st = statSync(fp);
+            const content = readFileSync(fp, 'utf8');
+            const titleLine = content.split('\n').find(l => l.startsWith('# '));
+            const title = titleLine ? titleLine.replace(/^#\s+/, '') : filename;
+            const week = filename.replace(/\.md$/, '');
+            return { filename, week, title, size: st.size };
+          });
+          jsonRes(res, 200, result);
+          return;
+        }
+
+        if (pathname.startsWith('/api/retros/') && req.method === 'GET') {
+          const filename = decodeURIComponent(pathname.replace('/api/retros/', ''));
+          const fp = resolve(RETROS_DIR, filename);
+          if (!fp.startsWith(RETROS_DIR + sep) && fp !== RETROS_DIR) {
+            jsonRes(res, 403, { error: 'Path traversal blocked' });
+            return;
+          }
+          try {
+            const content = readFileSync(fp, 'utf8');
+            jsonRes(res, 200, { filename, content });
+          } catch { jsonRes(res, 404, { error: 'Not found' }); }
+          return;
+        }
+
+        // ── GET /api/skills ───────────────────────────────────
+        if (pathname === '/api/skills' && req.method === 'GET') {
+          const skills: Array<{ name: string; description: string; path: string; isLocal: boolean }> = [];
+
+          const scanDir = (dir: string, isLocal: boolean) => {
+            try {
+              for (const name of readdirSync(dir)) {
+                const skillMd = join(dir, name, 'SKILL.md');
+                try {
+                  const raw = readFileSync(skillMd, 'utf8');
+                  // Skip frontmatter, get first sentence
+                  const lines = raw.split('\n');
+                  let descStart = 0;
+                  if (lines[0]?.trim() === '---') {
+                    descStart = lines.indexOf('---', 1) + 1;
+                  }
+                  const descLines = lines.slice(descStart).filter(l => l.trim().length > 0);
+                  const firstSentence = descLines[0]?.replace(/\.\s.*$/, '.') || name;
+                  skills.push({ name, description: firstSentence, path: join(dir, name), isLocal });
+                } catch { /* no SKILL.md */ }
+              }
+            } catch { /* dir doesn't exist */ }
+          };
+
+          scanDir(WORKSPACE_DIR, true);
+          scanDir(SKILLS_GLOBAL_DIR, false);
+          jsonRes(res, 200, { skills });
+          return;
+        }
+
+        // ── GET /api/sessions/list ────────────────────────────
+        if (pathname === '/api/sessions/list' && req.method === 'GET') {
+          const allSessions: Array<Record<string, unknown>> = [];
+          try {
+            if (existsSync(AGENTS_DIR)) {
+              for (const agentId of readdirSync(AGENTS_DIR)) {
+                const sessFile = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
+                try {
+                  if (!existsSync(sessFile)) continue;
+                  const entries = JSON.parse(readFileSync(sessFile, 'utf8')) as Record<string, Record<string, unknown>>;
+                  for (const [key, value] of Object.entries(entries)) {
+                    const parts = key.split(':');
+                    allSessions.push({
+                      key,
+                      agentId: parts[1] || agentId,
+                      channel: (value.channel as string) || (value.lastChannel as string) || parts[2] || 'unknown',
+                      kind: parts[3] || 'direct',
+                      target: parts.slice(4).join(':') || '',
+                      sessionId: value.sessionId,
+                      updatedAt: value.updatedAt,
+                      displayName: value.displayName,
+                      model: value.model,
+                      totalTokens: value.totalTokens,
+                      inputTokens: value.inputTokens,
+                      outputTokens: value.outputTokens,
+                      chatType: value.chatType,
+                    });
+                  }
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* skip */ }
+          allSessions.sort((a, b) => ((b.updatedAt as number) || 0) - ((a.updatedAt as number) || 0));
+          jsonRes(res, 200, allSessions.slice(0, 200));
+          return;
+        }
+
+        // ── GET /api/sessions/:encodedKey/history ─────────────
+        const historyMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/history$/);
+        if (historyMatch && req.method === 'GET') {
+          const encodedKey = historyMatch[1];
+          const sessionKey = decodeURIComponent(encodedKey);
+          const limit = parseInt(parsedUrl.searchParams.get('limit') || '50', 10);
+
+          // Find sessionId from sessions.json
+          let sessionId: string | null = null;
+          try {
+            for (const agentId of readdirSync(AGENTS_DIR)) {
+              const sessFile = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
+              try {
+                const entries = JSON.parse(readFileSync(sessFile, 'utf8')) as Record<string, Record<string, unknown>>;
+                if (entries[sessionKey]) {
+                  sessionId = entries[sessionKey].sessionId as string;
+                  break;
+                }
+              } catch { continue; }
+            }
+          } catch { /* skip */ }
+
+          if (!sessionId) {
+            jsonRes(res, 404, { error: 'Session not found', messages: [] });
+            return;
+          }
+
+          // Find and read the JSONL history file
+          let messages: Array<Record<string, unknown>> = [];
+          try {
+            for (const agentId of readdirSync(AGENTS_DIR)) {
+              const histFile = join(AGENTS_DIR, agentId, 'sessions', `${sessionId}.jsonl`);
+              if (existsSync(histFile)) {
+                const raw = readJsonl(histFile) as Array<Record<string, unknown>>;
+                messages = raw.map(m => ({
+                  role: m.role || m.type || 'unknown',
+                  content: m.content || m.text || '',
+                  timestamp: m.timestamp || m.createdAt || null,
+                }));
+                break;
+              }
+            }
+          } catch { /* skip */ }
+
+          jsonRes(res, 200, { messages: messages.slice(-limit) });
           return;
         }
 
@@ -211,11 +541,7 @@ program
         // Collect body for non-GET requests
         let reqBody: string | undefined;
         if (req.method !== 'GET' && req.method !== 'HEAD') {
-          reqBody = await new Promise<string>((resolve) => {
-            let body = '';
-            req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-            req.on('end', () => resolve(body));
-          });
+          reqBody = await collectBody(req);
         }
 
         const proxyRes = await fetch(`${upstreamUrl}${url}`, {
