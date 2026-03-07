@@ -507,19 +507,55 @@ program
           }
 
           // Find and read the JSONL history file
+          // Files can be UUID.jsonl or UUID-topic-SLUG.jsonl
           let messages: Array<Record<string, unknown>> = [];
           try {
             for (const agentId of readdirSync(AGENTS_DIR)) {
-              const histFile = join(AGENTS_DIR, agentId, 'sessions', `${sessionId}.jsonl`);
-              if (existsSync(histFile)) {
-                const raw = readJsonl(histFile) as Array<Record<string, unknown>>;
-                messages = raw.map(m => ({
-                  role: m.role || m.type || 'unknown',
-                  content: m.content || m.text || '',
-                  timestamp: m.timestamp || m.createdAt || null,
-                }));
-                break;
+              const sessDir = join(AGENTS_DIR, agentId, 'sessions');
+              if (!existsSync(sessDir)) continue;
+
+              // Try exact UUID.jsonl first, then glob UUID-topic-*.jsonl
+              let histFile = join(sessDir, `${sessionId}.jsonl`);
+              if (!existsSync(histFile)) {
+                const files = readdirSync(sessDir).filter(f => f.startsWith(`${sessionId}-`) && f.endsWith('.jsonl') && !f.includes('.deleted'));
+                if (files.length > 0) histFile = join(sessDir, files[0]);
+                else continue;
               }
+
+              const raw = readJsonl(histFile) as Array<Record<string, unknown>>;
+              messages = raw
+                .filter(m => {
+                  // OpenClaw JSONL has type-based entries; we want 'message' type
+                  // or direct role-based entries (user/assistant)
+                  const typ = m.type as string | undefined;
+                  const role = m.role as string | undefined;
+                  if (typ === 'message') return true;
+                  if (role === 'user' || role === 'assistant') return true;
+                  return false;
+                })
+                .map(m => {
+                  // Handle nested message format: { type: 'message', message: { role, content } }
+                  const nested = m.message as Record<string, unknown> | undefined;
+                  const role = nested?.role || m.role || 'unknown';
+                  const rawContent = nested?.content ?? m.content ?? '';
+                  // Content can be string or array of { type: 'text', text: '...' }
+                  let content = '';
+                  if (typeof rawContent === 'string') {
+                    content = rawContent;
+                  } else if (Array.isArray(rawContent)) {
+                    content = (rawContent as Array<{ type?: string; text?: string }>)
+                      .filter(c => c.type === 'text')
+                      .map(c => c.text || '')
+                      .join('\n');
+                  }
+                  return {
+                    role,
+                    content,
+                    timestamp: m.timestamp || nested?.timestamp || null,
+                  };
+                })
+                .filter(m => (m.role === 'user' || m.role === 'assistant') && m.content.trim().length > 0);
+              break;
             }
           } catch { /* skip */ }
 
