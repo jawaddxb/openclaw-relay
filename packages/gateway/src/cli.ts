@@ -1300,4 +1300,284 @@ program
     console.log();
   });
 
+// ── Service management (install/uninstall/logs) ────────────────────────────
+
+const LABEL = 'io.agentdraw.gateway';
+const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
+const LOG_DIR = join(homedir(), '.agentdraw', 'logs');
+const STDOUT_LOG = join(LOG_DIR, 'gateway.log');
+const STDERR_LOG = join(LOG_DIR, 'gateway.err.log');
+
+function resolveNodePath(): string {
+  // Find the absolute node binary path
+  const candidates = [
+    process.execPath, // current node
+    '/opt/homebrew/bin/node',
+    '/usr/local/bin/node',
+    '/usr/bin/node',
+  ];
+  for (const c of candidates) {
+    try { statSync(c); return c; } catch { /* skip */ }
+  }
+  return process.execPath;
+}
+
+function resolveCliScript(): string {
+  // Find the agentdraw CLI script — could be npx cache, global install, or local
+  const mainModule = process.argv[1];
+  if (mainModule && existsSync(mainModule)) return resolve(mainModule);
+  // Fallback: look in common locations
+  const globalPaths = [
+    join(homedir(), '.npm', '_npx'), // npx cache
+    '/opt/homebrew/lib/node_modules/agentdraw',
+    '/usr/local/lib/node_modules/agentdraw',
+  ];
+  for (const base of globalPaths) {
+    const candidate = join(base, 'bin', 'agentdraw.js');
+    if (existsSync(candidate)) return candidate;
+    // npx cache has hash dirs
+    try {
+      for (const dir of readdirSync(base)) {
+        const deep = join(base, dir, 'node_modules', 'agentdraw', 'bin', 'agentdraw.js');
+        if (existsSync(deep)) return deep;
+        const deeper = join(base, dir, 'node_modules', '.package-lock.json');
+        if (existsSync(deeper)) {
+          // Check if this npx cache has agentdraw
+          const binPath = join(base, dir, 'node_modules', 'agentdraw', 'bin', 'agentdraw.js');
+          if (existsSync(binPath)) return binPath;
+        }
+      }
+    } catch { /* not a dir */ }
+  }
+  return mainModule || 'agentdraw';
+}
+
+function getGuiDomain(): string {
+  try {
+    return `gui/${process.getuid!()}`;
+  } catch {
+    return 'gui/501';
+  }
+}
+
+function isServiceLoaded(): boolean {
+  try {
+    const { execSync } = require('node:child_process');
+    const out = execSync(`launchctl print ${getGuiDomain()}/${LABEL} 2>&1`, { encoding: 'utf-8' });
+    return !out.includes('Could not find service');
+  } catch {
+    return false;
+  }
+}
+
+function buildPlist(nodePath: string, scriptPath: string): string {
+  const config = loadConfig();
+  const env: Record<string, string> = {
+    HOME: homedir(),
+    PATH: process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',
+  };
+
+  // Build args: node script connect (with any needed flags)
+  const args = [nodePath, scriptPath, 'connect'];
+
+  // If config exists with token, pass it explicitly for reliability
+  if (config?.gateway_token) {
+    args.push('--token', config.gateway_token);
+  }
+  if (config?.relay_url && config.relay_url !== DEFAULT_RELAY) {
+    args.push('--relay', config.relay_url.replace(/^http/, 'ws').replace(/\/$/, '') + '/v1/tunnel');
+  }
+
+  const argsXml = args.map(a => `\n      <string>${plistEscape(a)}</string>`).join('');
+  const envEntries = Object.entries(env)
+    .map(([k, v]) => `\n    <key>${plistEscape(k)}</key>\n    <string>${plistEscape(v)}</string>`)
+    .join('');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>Comment</key>
+    <string>AgentDraw Gateway Connector</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProgramArguments</key>
+    <array>${argsXml}
+    </array>
+    <key>StandardOutPath</key>
+    <string>${plistEscape(STDOUT_LOG)}</string>
+    <key>StandardErrorPath</key>
+    <string>${plistEscape(STDERR_LOG)}</string>
+    <key>EnvironmentVariables</key>
+    <dict>${envEntries}
+    </dict>
+  </dict>
+</plist>
+`;
+}
+
+function plistEscape(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+program
+  .command('install')
+  .description('Install AgentDraw as a background service (macOS launchd)')
+  .option('--force', 'Reinstall even if already installed')
+  .action(async (opts: { force?: boolean }) => {
+    if (platform() !== 'darwin') {
+      console.error('\n  ✗ Service install is currently macOS-only (launchd).');
+      console.error('    Linux systemd support coming soon.\n');
+      process.exit(1);
+    }
+
+    const config = loadConfig();
+    if (!config) {
+      console.error('\n  ✗ Not linked. Run `agentdraw link` first.\n');
+      process.exit(1);
+    }
+
+    const { execSync } = require('node:child_process');
+
+    // Check if already installed
+    if (existsSync(PLIST_PATH) && !opts.force) {
+      if (isServiceLoaded()) {
+        console.log('\n  ✓ AgentDraw service is already installed and running.');
+        console.log('    Use `agentdraw uninstall` first, or `agentdraw install --force` to reinstall.\n');
+        process.exit(0);
+      }
+    }
+
+    // Unload old service if exists
+    if (isServiceLoaded()) {
+      try {
+        execSync(`launchctl bootout ${getGuiDomain()}/${LABEL} 2>/dev/null`, { encoding: 'utf-8' });
+      } catch { /* might not be loaded */ }
+    }
+
+    // Kill any stale agentdraw processes on sidecar port
+    try {
+      const pids = execSync('lsof -ti :18790', { encoding: 'utf-8' }).trim();
+      if (pids) {
+        for (const pid of pids.split('\n')) {
+          try { process.kill(parseInt(pid), 'SIGKILL'); } catch { /* already dead */ }
+        }
+      }
+    } catch { /* nothing on port */ }
+
+    // Resolve paths
+    const nodePath = resolveNodePath();
+    const scriptPath = resolveCliScript();
+
+    console.log(`\n  Installing AgentDraw service...`);
+    console.log(`  Node:    ${nodePath}`);
+    console.log(`  Script:  ${scriptPath}`);
+    console.log(`  Gateway: ${config.gateway_id}`);
+    console.log(`  Relay:   ${config.relay_url}`);
+
+    // Create log directory
+    mkdirSync(LOG_DIR, { recursive: true });
+
+    // Write plist
+    const plist = buildPlist(nodePath, scriptPath);
+    writeFileSync(PLIST_PATH, plist);
+    console.log(`  Plist:   ${PLIST_PATH}`);
+
+    // Bootstrap
+    try {
+      execSync(`launchctl bootstrap ${getGuiDomain()} ${PLIST_PATH}`, { encoding: 'utf-8' });
+    } catch {
+      // Try legacy load as fallback
+      try {
+        execSync(`launchctl load ${PLIST_PATH}`, { encoding: 'utf-8' });
+      } catch (e) {
+        console.error(`\n  ✗ Failed to load service: ${(e as Error).message}\n`);
+        process.exit(1);
+      }
+    }
+
+    // Wait a moment and check
+    await new Promise(r => setTimeout(r, 2000));
+
+    if (isServiceLoaded()) {
+      console.log('\n  ✓ AgentDraw service installed and running!');
+      console.log('    It will auto-start on login and reconnect if it crashes.');
+      console.log(`    Logs: tail -f ${STDOUT_LOG}\n`);
+    } else {
+      console.error('\n  ⚠ Service installed but may not be running.');
+      console.error(`    Check logs: tail -f ${STDERR_LOG}\n`);
+    }
+  });
+
+program
+  .command('uninstall')
+  .description('Uninstall AgentDraw background service')
+  .action(async () => {
+    if (platform() !== 'darwin') {
+      console.error('\n  ✗ Service uninstall is currently macOS-only.\n');
+      process.exit(1);
+    }
+
+    const { execSync } = require('node:child_process');
+
+    if (isServiceLoaded()) {
+      try {
+        execSync(`launchctl bootout ${getGuiDomain()}/${LABEL}`, { encoding: 'utf-8' });
+        console.log('\n  ✓ Service stopped.');
+      } catch {
+        try {
+          execSync(`launchctl unload ${PLIST_PATH}`, { encoding: 'utf-8' });
+          console.log('\n  ✓ Service stopped.');
+        } catch { /* best effort */ }
+      }
+    }
+
+    if (existsSync(PLIST_PATH)) {
+      unlinkSync(PLIST_PATH);
+      console.log('  ✓ Plist removed.');
+    }
+
+    // Kill any remaining processes
+    try {
+      const pids = execSync('lsof -ti :18790', { encoding: 'utf-8' }).trim();
+      if (pids) {
+        for (const pid of pids.split('\n')) {
+          try { process.kill(parseInt(pid), 'SIGKILL'); } catch { /* already dead */ }
+        }
+      }
+    } catch { /* nothing */ }
+
+    console.log('  ✓ AgentDraw service uninstalled.\n');
+  });
+
+program
+  .command('logs')
+  .description('Show AgentDraw service logs')
+  .option('-f, --follow', 'Follow log output (tail -f)')
+  .option('-n, --lines <n>', 'Number of lines to show', '50')
+  .action((opts: { follow?: boolean; lines: string }) => {
+    const { execSync, spawn } = require('node:child_process');
+    const logFile = existsSync(STDOUT_LOG) ? STDOUT_LOG : STDERR_LOG;
+
+    if (!existsSync(logFile)) {
+      console.log('\n  No logs found. Is the service installed? Run `agentdraw install`.\n');
+      process.exit(0);
+    }
+
+    if (opts.follow) {
+      console.log(`  Tailing ${logFile}...\n`);
+      const tail = spawn('tail', ['-f', '-n', opts.lines, logFile], { stdio: 'inherit' });
+      tail.on('close', () => process.exit(0));
+    } else {
+      const output = execSync(`tail -n ${opts.lines} "${logFile}"`, { encoding: 'utf-8' });
+      console.log(output);
+    }
+  });
+
 program.parse();
