@@ -132,18 +132,32 @@ const program = new Command();
 program
   .name('agentdraw')
   .description('AgentDraw — Connect your AI agents to the cloud')
-  .version('0.1.0');
+  .version('0.1.1');
 
 program
   .command('connect')
   .description('Connect gateway to relay server')
-  .requiredOption('--token <token>', 'Gateway token (gw_live_xxx)')
-  .requiredOption('--upstream <url>', 'Local HTTP server to tunnel to')
+  .option('--token <token>', 'Gateway token (gw_live_xxx) — auto-reads from ~/.agentdraw/config.json if linked')
+  .option('--upstream <url>', 'Local HTTP server to tunnel to', 'http://localhost:18789')
   .option('--relay <url>', 'Relay WebSocket URL', DEFAULT_WS_RELAY)
   .option('--name <name>', 'Gateway display name')
   .option('--openclaw-token <token>', 'OpenClaw gateway token for RPC sidecar')
   .option('--sidecar-port <port>', 'Port for JSON sidecar server', '18790')
   .action(async (opts) => {
+    // Auto-read token from config if not provided
+    if (!opts.token) {
+      const config = loadConfig();
+      if (config?.gateway_token) {
+        opts.token = config.gateway_token;
+        if (config.relay_url) {
+          opts.relay = config.relay_url.replace(/^https?/, 'wss') + '/v1/tunnel';
+        }
+        console.log(`  Using linked gateway: ${config.gateway_id ?? 'unknown'}`);
+      } else {
+        console.error('\n  No gateway token. Run `agentdraw link` first, or pass --token.\n');
+        process.exit(1);
+      }
+    }
     const upstreamUrl = opts.upstream as string;
     const sidecarPort = parseInt(opts.sidecarPort, 10);
 

@@ -8674,8 +8674,21 @@ function serveWorkspace(url) {
 var DEFAULT_RELAY = "https://divine-freedom-production.up.railway.app";
 var DEFAULT_WS_RELAY = DEFAULT_RELAY.replace(/^https?/, "wss") + "/v1/tunnel";
 var program2 = new Command();
-program2.name("agentdraw").description("AgentDraw \u2014 Connect your AI agents to the cloud").version("0.1.0");
-program2.command("connect").description("Connect gateway to relay server").requiredOption("--token <token>", "Gateway token (gw_live_xxx)").requiredOption("--upstream <url>", "Local HTTP server to tunnel to").option("--relay <url>", "Relay WebSocket URL", DEFAULT_WS_RELAY).option("--name <name>", "Gateway display name").option("--openclaw-token <token>", "OpenClaw gateway token for RPC sidecar").option("--sidecar-port <port>", "Port for JSON sidecar server", "18790").action(async (opts) => {
+program2.name("agentdraw").description("AgentDraw \u2014 Connect your AI agents to the cloud").version("0.1.1");
+program2.command("connect").description("Connect gateway to relay server").option("--token <token>", "Gateway token (gw_live_xxx) \u2014 auto-reads from ~/.agentdraw/config.json if linked").option("--upstream <url>", "Local HTTP server to tunnel to", "http://localhost:18789").option("--relay <url>", "Relay WebSocket URL", DEFAULT_WS_RELAY).option("--name <name>", "Gateway display name").option("--openclaw-token <token>", "OpenClaw gateway token for RPC sidecar").option("--sidecar-port <port>", "Port for JSON sidecar server", "18790").action(async (opts) => {
+  if (!opts.token) {
+    const config = loadConfig();
+    if (config?.gateway_token) {
+      opts.token = config.gateway_token;
+      if (config.relay_url) {
+        opts.relay = config.relay_url.replace(/^https?/, "wss") + "/v1/tunnel";
+      }
+      console.log(`  Using linked gateway: ${config.gateway_id ?? "unknown"}`);
+    } else {
+      console.error("\n  No gateway token. Run `agentdraw link` first, or pass --token.\n");
+      process.exit(1);
+    }
+  }
   const upstreamUrl = opts.upstream;
   const sidecarPort = parseInt(opts.sidecarPort, 10);
   const ocWsUrl = upstreamUrl.replace(/^http/, "ws");

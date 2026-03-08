@@ -1,6 +1,6 @@
 {
   "name": "agentdraw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Connect your AI agents to the cloud. One command to link, tunnel, and manage your OpenClaw gateway.",
   "bin": {
     "agentdraw": "bin/agentdraw.js"
