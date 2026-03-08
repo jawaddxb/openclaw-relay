@@ -657,6 +657,43 @@ export async function createRelayServer(
     };
   });
 
+  // ── Shared: resolve gateway from Bearer token (app token OR JWT) ──
+
+  function resolveGatewayFromToken(
+    token: string,
+    requestHeaders?: Record<string, string | string[] | undefined>,
+  ): { gatewayId: string; appId: string } | null {
+    // Try app token first (legacy pairing flow)
+    const appInfo = db.validateAppToken(token);
+    if (appInfo) {
+      return { gatewayId: appInfo.gatewayId, appId: appInfo.id };
+    }
+
+    // Try JWT auth
+    const jwtPayload = verifyJWT(token);
+    if (!jwtPayload) return null;
+
+    const requestedGatewayId = requestHeaders?.['x-gateway-id'] as string | undefined;
+    const userGateways = db.listUserGateways(jwtPayload.sub);
+    if (userGateways.length === 0) return null;
+
+    let gatewayId: string | null = null;
+    if (requestedGatewayId) {
+      const match = userGateways.find(g => g.id === requestedGatewayId);
+      if (match) gatewayId = match.id;
+    }
+    if (!gatewayId && userGateways.length === 1) {
+      gatewayId = userGateways[0].id;
+    }
+    if (!gatewayId) {
+      // Pick first connected, or first
+      const connected = userGateways.find(g => hub.isGatewayConnected(g.id));
+      gatewayId = connected?.id ?? userGateways[0].id;
+    }
+
+    return { gatewayId, appId: `jwt:${jwtPayload.sub}` };
+  }
+
   // ── App request forwarding ───────────────────────────────────
 
   app.all<{
@@ -669,12 +706,13 @@ export async function createRelayServer(
     }
 
     const token = auth.slice(7);
-    const appInfo = db.validateAppToken(token);
-    if (!appInfo) {
+    const resolved = resolveGatewayFromToken(token, request.headers as Record<string, string | string[] | undefined>);
+    if (!resolved) {
       return reply.status(401).send({ error: 'Invalid app token' });
     }
+    const { gatewayId, appId } = resolved;
 
-    if (!hub.isGatewayConnected(appInfo.gatewayId)) {
+    if (!hub.isGatewayConnected(gatewayId)) {
       return reply.status(502).send({
         error: 'gateway_offline',
         message: 'Gateway is not connected',
@@ -693,7 +731,7 @@ export async function createRelayServer(
         headers[key] = val;
       }
     }
-    headers['x-relay-app-id'] = appInfo.id;
+    headers['x-relay-app-id'] = appId;
     headers['x-relay-forwarded-for'] = request.ip;
     if (request.headers['x-request-id']) {
       headers['x-request-id'] = request.headers['x-request-id'] as string;
@@ -707,7 +745,7 @@ export async function createRelayServer(
       try {
         let headersWritten = false;
         await hub.forwardRequest(
-          appInfo.gatewayId,
+          gatewayId,
           {
             method: request.method,
             path,
@@ -747,7 +785,7 @@ export async function createRelayServer(
     } else {
       // Regular request/response
       try {
-        const response = await hub.forwardRequest(appInfo.gatewayId, {
+        const response = await hub.forwardRequest(gatewayId, {
           method: request.method,
           path,
           headers,
@@ -802,10 +840,11 @@ export async function createRelayServer(
     }
 
     const token = auth.slice(7);
-    const appInfo = db.validateAppToken(token);
-    if (!appInfo) {
+    const resolved = resolveGatewayFromToken(token, request.headers as Record<string, string | string[] | undefined>);
+    if (!resolved) {
       return reply.status(401).send({ error: 'Invalid app token' });
     }
+    const { gatewayId } = resolved;
 
     const origin = request.headers.origin || '*';
     reply.raw.writeHead(200, {
@@ -817,13 +856,13 @@ export async function createRelayServer(
     });
 
     // Send initial connection event
-    reply.raw.write(`event: connected\ndata: ${JSON.stringify({ gatewayId: appInfo.gatewayId })}\n\n`);
+    reply.raw.write(`event: connected\ndata: ${JSON.stringify({ gatewayId: gatewayId })}\n\n`);
 
     // Send current gateway status immediately so the client doesn't stay in "Checking..."
-    const isGwConnected = hub.isGatewayConnected(appInfo.gatewayId);
+    const isGwConnected = hub.isGatewayConnected(gatewayId);
     reply.raw.write(`event: gateway:status\ndata: ${JSON.stringify({ connected: isGwConnected })}\n\n`);
 
-    const client = { res: reply.raw, gatewayId: appInfo.gatewayId };
+    const client = { res: reply.raw, gatewayId: gatewayId };
     sseClients.add(client);
 
     // Keepalive ping every 15s
@@ -848,14 +887,15 @@ export async function createRelayServer(
       return reply.status(401).send({ error: 'Missing authorization' });
     }
     const token = auth.slice(7);
-    const appInfo = db.validateAppToken(token);
-    if (!appInfo) {
+    const resolved = resolveGatewayFromToken(token, request.headers as Record<string, string | string[] | undefined>);
+    if (!resolved) {
       return reply.status(401).send({ error: 'Invalid app token' });
     }
+    const { gatewayId } = resolved;
 
     const { method, params = {} } = request.body ?? {};
 
-    if (!hub.isGatewayConnected(appInfo.gatewayId)) {
+    if (!hub.isGatewayConnected(gatewayId)) {
       return reply.status(502).send({ error: { message: 'Gateway is not connected' } });
     }
 
@@ -865,7 +905,7 @@ export async function createRelayServer(
       const limit = (params.limit as number) ?? 100;
       const activeMinutes = (params.activeMinutes as number) ?? 1440;
       try {
-        const response = await hub.forwardRequest(appInfo.gatewayId, {
+        const response = await hub.forwardRequest(gatewayId, {
           method: 'POST',
           path: '/tools/invoke',
           headers: { 'content-type': 'application/json' },
@@ -904,7 +944,7 @@ export async function createRelayServer(
 
     if (method === 'gateway.status') {
       try {
-        const response = await hub.forwardRequest(appInfo.gatewayId, {
+        const response = await hub.forwardRequest(gatewayId, {
           method: 'GET',
           path: '/status',
           headers: {},
