@@ -13,6 +13,7 @@ import {
   signJWT,
   verifyJWT,
   checkRateLimit,
+  sendEmail,
 } from './auth.js';
 import type { JWTPayload } from './auth.js';
 
@@ -148,6 +149,8 @@ export async function createRelayServer(
     );
   });
 
+  const WEB_APP_URL = process.env.WEB_APP_URL || 'https://agentdraw-web-production.up.railway.app';
+
   // ══════════════════════════════════════════════════════════════
   // AUTH ROUTES
   // ══════════════════════════════════════════════════════════════
@@ -190,6 +193,24 @@ export async function createRelayServer(
 
     const jwt = signJWT({ sub: user.id, sid: sessionId, email: user.email });
     setSessionCookie(reply, jwt);
+
+    // Fire-and-forget verification email on registration
+    const { token: verifyToken } = db.createEmailVerificationToken(user.id);
+    const verifyUrl = `${WEB_APP_URL}/verify-email?token=${encodeURIComponent(verifyToken)}`;
+    sendEmail({
+      to: email,
+      subject: 'Verify your AgentDraw email',
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+          <h1 style="font-size: 24px; color: #C9920A;">✦ AgentDraw</h1>
+          <p>Welcome! Verify your email to secure your account.</p>
+          <a href="${verifyUrl}" style="display: inline-block; background: #C9920A; color: #0A0A0A; text-decoration: none; padding: 12px 32px; border-radius: 8px; font-weight: bold; margin: 20px 0;">Verify Email</a>
+          <p style="color: #666; font-size: 13px;">Or paste this link: ${verifyUrl}</p>
+          <p style="color: #999; font-size: 11px;">This link expires in 24 hours.</p>
+        </div>
+      `,
+      text: `Verify your AgentDraw email: ${verifyUrl}`,
+    }).catch(() => {}); // Non-blocking
 
     return reply.send({
       user: { id: user.id, email: user.email, name: user.name },
@@ -304,7 +325,7 @@ export async function createRelayServer(
     return reply.send({
       device_code: result.deviceCode,
       user_code: result.userCode,
-      verification_url: process.env.WEB_APP_URL || 'https://agentdraw-web-production.up.railway.app/link',
+      verification_url: `${WEB_APP_URL}/link`,
       expires_at: result.expiresAt,
       interval: result.interval,
     });
@@ -412,6 +433,121 @@ export async function createRelayServer(
       gateway_token: result.gatewayToken,
       gateway_id: result.gatewayId,
     });
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  // EMAIL VERIFICATION
+  // ══════════════════════════════════════════════════════════════
+
+  // ── POST /api/auth/verify-email/send — Send verification email ──
+
+  app.post('/api/auth/verify-email/send', async (request, reply) => {
+    const auth = requireAuth(request, reply);
+    if (!auth) return;
+
+    if (!checkRateLimit(`verify-email:${auth.sub}`, 3, 3600_000)) {
+      return reply.status(429).send({ error: 'Too many verification emails, try again later' });
+    }
+
+    const user = db.findUserById(auth.sub);
+    if (!user) return reply.status(404).send({ error: 'User not found' });
+    if (user.email_verified) return reply.send({ ok: true, message: 'Email already verified' });
+
+    const { token } = db.createEmailVerificationToken(auth.sub);
+
+    const verifyUrl = `${WEB_APP_URL}/verify-email?token=${encodeURIComponent(token)}`;
+
+    await sendEmail({
+      to: user.email,
+      subject: 'Verify your AgentDraw email',
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+          <h1 style="font-size: 24px; color: #C9920A;">✦ AgentDraw</h1>
+          <p>Verify your email address to secure your account.</p>
+          <a href="${verifyUrl}" style="display: inline-block; background: #C9920A; color: #0A0A0A; text-decoration: none; padding: 12px 32px; border-radius: 8px; font-weight: bold; margin: 20px 0;">Verify Email</a>
+          <p style="color: #666; font-size: 13px;">Or paste this link: ${verifyUrl}</p>
+          <p style="color: #999; font-size: 11px;">This link expires in 24 hours.</p>
+        </div>
+      `,
+      text: `Verify your AgentDraw email: ${verifyUrl}`,
+    });
+
+    return reply.send({ ok: true, message: 'Verification email sent' });
+  });
+
+  // ── POST /api/auth/verify-email — Verify token ──
+
+  app.post<{
+    Body: { token: string };
+  }>('/api/auth/verify-email', async (request, reply) => {
+    const { token } = request.body ?? {};
+    if (!token) return reply.status(400).send({ error: 'Token required' });
+
+    const result = db.verifyEmail(token);
+    if (!result) return reply.status(400).send({ error: 'Invalid or expired verification token' });
+
+    return reply.send({ ok: true, message: 'Email verified' });
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  // PASSWORD RESET
+  // ══════════════════════════════════════════════════════════════
+
+  // ── POST /api/auth/forgot-password — Request reset ──
+
+  app.post<{
+    Body: { email: string };
+  }>('/api/auth/forgot-password', async (request, reply) => {
+    const { email } = request.body ?? {};
+    if (!email) return reply.status(400).send({ error: 'Email required' });
+
+    if (!checkRateLimit(`reset:${email}`, 3, 3600_000)) {
+      return reply.status(429).send({ error: 'Too many reset requests, try again later' });
+    }
+
+    // Always return success to prevent email enumeration
+    const user = db.findUserByEmail(email);
+    if (!user) return reply.send({ ok: true, message: 'If that email exists, a reset link has been sent' });
+
+    const { token } = db.createPasswordResetToken(user.id);
+
+    const resetUrl = `${WEB_APP_URL}/reset-password?token=${encodeURIComponent(token)}`;
+
+    await sendEmail({
+      to: user.email,
+      subject: 'Reset your AgentDraw password',
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+          <h1 style="font-size: 24px; color: #C9920A;">✦ AgentDraw</h1>
+          <p>You requested a password reset. Click below to set a new password.</p>
+          <a href="${resetUrl}" style="display: inline-block; background: #C9920A; color: #0A0A0A; text-decoration: none; padding: 12px 32px; border-radius: 8px; font-weight: bold; margin: 20px 0;">Reset Password</a>
+          <p style="color: #666; font-size: 13px;">Or paste this link: ${resetUrl}</p>
+          <p style="color: #999; font-size: 11px;">This link expires in 1 hour. If you didn't request this, ignore this email.</p>
+        </div>
+      `,
+      text: `Reset your AgentDraw password: ${resetUrl}`,
+    });
+
+    return reply.send({ ok: true, message: 'If that email exists, a reset link has been sent' });
+  });
+
+  // ── POST /api/auth/reset-password — Execute reset ──
+
+  app.post<{
+    Body: { token: string; password: string };
+  }>('/api/auth/reset-password', async (request, reply) => {
+    const { token, password } = request.body ?? {};
+    if (!token || !password) return reply.status(400).send({ error: 'Token and password required' });
+
+    if (password.length < 8) {
+      return reply.status(400).send({ error: 'Password must be at least 8 characters' });
+    }
+
+    const newHash = hashPassword(password);
+    const result = db.resetPassword(token, newHash);
+    if (!result) return reply.status(400).send({ error: 'Invalid or expired reset token' });
+
+    return reply.send({ ok: true, message: 'Password reset successfully. Please log in.' });
   });
 
   // ══════════════════════════════════════════════════════════════

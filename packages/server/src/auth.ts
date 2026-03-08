@@ -65,3 +65,52 @@ setInterval(() => {
     if (now > entry.resetAt) rateLimits.delete(key);
   }
 }, 60_000).unref();
+
+// ── Email sender (Resend API or log-only fallback) ─────────────
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'AgentDraw <noreply@agentdraw.io>';
+
+export interface EmailOptions {
+  to: string;
+  subject: string;
+  html: string;
+  text?: string;
+}
+
+export async function sendEmail(opts: EmailOptions): Promise<boolean> {
+  if (!RESEND_API_KEY) {
+    console.log(`[email] No RESEND_API_KEY — logging email instead:`);
+    console.log(`[email] To: ${opts.to} | Subject: ${opts.subject}`);
+    console.log(`[email] Body: ${opts.text || '(html only)'}`);
+    return true; // Don't block flows when email isn't configured
+  }
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: opts.to,
+        subject: opts.subject,
+        html: opts.html,
+        text: opts.text,
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[email] Resend API error: ${res.status} ${body}`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error(`[email] Send failed:`, err);
+    return false;
+  }
+}

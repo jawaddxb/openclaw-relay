@@ -263,12 +263,32 @@ export class RelayDB {
         expires_at      INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash      TEXT NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        used_at         INTEGER,
+        created_at      INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash      TEXT NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        used_at         INTEGER,
+        created_at      INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_user_gateways_user ON user_gateways(user_id);
       CREATE INDEX IF NOT EXISTS idx_user_gateways_token ON user_gateways(token_hash);
       CREATE INDEX IF NOT EXISTS idx_user_providers_user ON user_providers(user_id);
       CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth(user_code);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_user ON link_tokens(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user ON email_verification_tokens(user_id);
+      CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id);
     `);
   }
 
@@ -797,6 +817,89 @@ export class RelayDB {
     this.db
       .prepare('UPDATE user_gateways SET status = ?, last_seen = ? WHERE id = ?')
       .run(status, Date.now(), gatewayId);
+  }
+
+  // ── Email Verification ──────────────────────────────────────
+
+  createEmailVerificationToken(userId: string): { token: string; id: string; expiresAt: number } {
+    const id = crypto.randomUUID();
+    const rawToken = `ev_${crypto.randomBytes(24).toString('base64url')}`;
+    const tokenHash = hashToken(rawToken);
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+    // Invalidate previous tokens for this user
+    this.db
+      .prepare('UPDATE email_verification_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL')
+      .run(Date.now(), userId);
+
+    this.db
+      .prepare('INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, userId, tokenHash, expiresAt, Date.now());
+
+    return { token: rawToken, id, expiresAt };
+  }
+
+  verifyEmail(token: string): { userId: string } | null {
+    const tokenHash = hashToken(token);
+    const row = this.db
+      .prepare('SELECT user_id FROM email_verification_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?')
+      .get(tokenHash, Date.now()) as { user_id: string } | undefined;
+
+    if (!row) return null;
+
+    this.db
+      .prepare('UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?')
+      .run(Date.now(), tokenHash);
+
+    this.db
+      .prepare('UPDATE users SET email_verified = 1 WHERE id = ?')
+      .run(row.user_id);
+
+    return { userId: row.user_id };
+  }
+
+  // ── Password Reset ─────────────────────────────────────────
+
+  createPasswordResetToken(userId: string): { token: string; id: string; expiresAt: number } {
+    const id = crypto.randomUUID();
+    const rawToken = `pr_${crypto.randomBytes(24).toString('base64url')}`;
+    const tokenHash = hashToken(rawToken);
+    const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour
+
+    // Invalidate previous tokens
+    this.db
+      .prepare('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL')
+      .run(Date.now(), userId);
+
+    this.db
+      .prepare('INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, userId, tokenHash, expiresAt, Date.now());
+
+    return { token: rawToken, id, expiresAt };
+  }
+
+  resetPassword(token: string, newPasswordHash: string): { userId: string } | null {
+    const tokenHash = hashToken(token);
+    const row = this.db
+      .prepare('SELECT user_id FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?')
+      .get(tokenHash, Date.now()) as { user_id: string } | undefined;
+
+    if (!row) return null;
+
+    this.db
+      .prepare('UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ?')
+      .run(Date.now(), tokenHash);
+
+    this.db
+      .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+      .run(newPasswordHash, row.user_id);
+
+    // Invalidate all sessions (force re-login)
+    this.db
+      .prepare('DELETE FROM sessions WHERE user_id = ?')
+      .run(row.user_id);
+
+    return { userId: row.user_id };
   }
 
   close(): void {
