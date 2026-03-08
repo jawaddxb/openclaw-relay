@@ -587,8 +587,15 @@ program
                     descStart = lines.indexOf('---', 1) + 1;
                   }
                   const descLines = lines.slice(descStart).filter(l => l.trim().length > 0);
-                  const firstSentence = descLines[0]?.replace(/\.\s.*$/, '.') || name;
-                  skills.push({ name, description: firstSentence, path: join(dir, name), isLocal });
+                  // Get the actual description line (skip the # heading)
+                  let desc = '';
+                  for (const line of descLines) {
+                    if (line.startsWith('#')) continue; // skip headings
+                    desc = line.trim();
+                    break;
+                  }
+                  if (!desc) desc = descLines[0]?.replace(/^#\s+/, '') || name;
+                  skills.push({ name, description: desc, path: join(dir, name), isLocal });
                 } catch { /* no SKILL.md */ }
               }
             } catch { /* dir doesn't exist */ }
@@ -597,6 +604,32 @@ program
           scanDir(WORKSPACE_DIR, true);
           scanDir(SKILLS_GLOBAL_DIR, false);
           jsonRes(res, 200, { skills });
+          return;
+        }
+
+        // ── GET /api/skills/doc/:name ─────────────────────────
+        if (pathname.startsWith('/api/skills/doc/') && req.method === 'GET') {
+          const skillName = decodeURIComponent(pathname.split('/api/skills/doc/')[1]);
+          // Search workspace and global skills
+          const dirs = [WORKSPACE_DIR, SKILLS_GLOBAL_DIR];
+          let found = false;
+          for (const dir of dirs) {
+            const skillMd = join(dir, skillName, 'SKILL.md');
+            try {
+              const raw = readFileSync(skillMd, 'utf8');
+              // Strip frontmatter
+              let content = raw;
+              const lines = raw.split('\n');
+              if (lines[0]?.trim() === '---') {
+                const endIdx = lines.indexOf('---', 1);
+                if (endIdx > 0) content = lines.slice(endIdx + 1).join('\n').trim();
+              }
+              jsonRes(res, 200, { name: skillName, content, path: join(dir, skillName) });
+              found = true;
+              break;
+            } catch { /* try next dir */ }
+          }
+          if (!found) jsonRes(res, 404, { error: 'Skill not found' });
           return;
         }
 

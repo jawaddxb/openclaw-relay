@@ -9078,8 +9078,14 @@ program2.command("connect").description("Connect gateway to relay server").optio
                   descStart = lines.indexOf("---", 1) + 1;
                 }
                 const descLines = lines.slice(descStart).filter((l) => l.trim().length > 0);
-                const firstSentence = descLines[0]?.replace(/\.\s.*$/, ".") || name;
-                skills.push({ name, description: firstSentence, path: (0, import_node_path.join)(dir, name), isLocal });
+                let desc = "";
+                for (const line of descLines) {
+                  if (line.startsWith("#")) continue;
+                  desc = line.trim();
+                  break;
+                }
+                if (!desc) desc = descLines[0]?.replace(/^#\s+/, "") || name;
+                skills.push({ name, description: desc, path: (0, import_node_path.join)(dir, name), isLocal });
               } catch {
               }
             }
@@ -9089,6 +9095,29 @@ program2.command("connect").description("Connect gateway to relay server").optio
         scanDir(WORKSPACE_DIR, true);
         scanDir(SKILLS_GLOBAL_DIR, false);
         jsonRes(res, 200, { skills });
+        return;
+      }
+      if (pathname.startsWith("/api/skills/doc/") && req.method === "GET") {
+        const skillName = decodeURIComponent(pathname.split("/api/skills/doc/")[1]);
+        const dirs = [WORKSPACE_DIR, SKILLS_GLOBAL_DIR];
+        let found = false;
+        for (const dir of dirs) {
+          const skillMd = (0, import_node_path.join)(dir, skillName, "SKILL.md");
+          try {
+            const raw = (0, import_node_fs.readFileSync)(skillMd, "utf8");
+            let content = raw;
+            const lines = raw.split("\n");
+            if (lines[0]?.trim() === "---") {
+              const endIdx = lines.indexOf("---", 1);
+              if (endIdx > 0) content = lines.slice(endIdx + 1).join("\n").trim();
+            }
+            jsonRes(res, 200, { name: skillName, content, path: (0, import_node_path.join)(dir, skillName) });
+            found = true;
+            break;
+          } catch {
+          }
+        }
+        if (!found) jsonRes(res, 404, { error: "Skill not found" });
         return;
       }
       if (pathname === "/api/sessions/list" && req.method === "GET") {
