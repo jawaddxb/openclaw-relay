@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { createServer } from 'node:http';
 import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync } from 'node:fs';
 import { resolve, join, extname, normalize, sep, dirname } from 'node:path';
@@ -126,11 +124,14 @@ function serveWorkspace(url: string): { status: number; headers: Record<string, 
   }
 }
 
+const DEFAULT_RELAY = process.env.AGENTDRAW_DEFAULT_RELAY || 'https://divine-freedom-production.up.railway.app';
+const DEFAULT_WS_RELAY = DEFAULT_RELAY.replace(/^https?/, 'wss') + '/v1/tunnel';
+
 const program = new Command();
 
 program
-  .name('openclaw-relay')
-  .description('OpenClaw Relay Gateway CLI')
+  .name('agentdraw')
+  .description('AgentDraw — Connect your AI agents to the cloud')
   .version('0.1.0');
 
 program
@@ -138,7 +139,7 @@ program
   .description('Connect gateway to relay server')
   .requiredOption('--token <token>', 'Gateway token (gw_live_xxx)')
   .requiredOption('--upstream <url>', 'Local HTTP server to tunnel to')
-  .option('--relay <url>', 'Relay WebSocket URL', 'ws://localhost:8080/v1/tunnel')
+  .option('--relay <url>', 'Relay WebSocket URL', DEFAULT_WS_RELAY)
   .option('--name <name>', 'Gateway display name')
   .option('--openclaw-token <token>', 'OpenClaw gateway token for RPC sidecar')
   .option('--sidecar-port <port>', 'Port for JSON sidecar server', '18790')
@@ -679,7 +680,7 @@ program
   .command('pair')
   .description('Generate a pairing code for mobile app')
   .requiredOption('--token <token>', 'Gateway token (gw_live_xxx)')
-  .option('--relay <url>', 'Relay HTTP URL', 'http://localhost:8080')
+  .option('--relay <url>', 'Relay HTTP URL', DEFAULT_RELAY)
   .option('--name <name>', 'Gateway display name')
   .action(async (opts) => {
     const client = new GatewayClient({
@@ -747,7 +748,7 @@ program
   .command('devices')
   .description('List connected app devices')
   .requiredOption('--token <token>', 'Gateway token (gw_live_xxx)')
-  .option('--relay <url>', 'Relay HTTP URL', 'http://localhost:8080')
+  .option('--relay <url>', 'Relay HTTP URL', DEFAULT_RELAY)
   .action(async (opts) => {
     const client = new GatewayClient({
       relayUrl: opts.relay.replace(/^http/, 'ws') + '/v1/tunnel',
@@ -763,7 +764,7 @@ program
 
       if (apps.length === 0) {
         console.log('\n  No devices connected.');
-        console.log('  Run `openclaw-relay pair` to connect a device.\n');
+        console.log('  Run `agentdraw pair` to connect a device.\n');
       } else {
         for (const [i, app] of apps.entries()) {
           console.log(`\n  ${i + 1}. ${app.deviceName}`);
@@ -834,7 +835,7 @@ function getMachineId(info: { hostname: string; os: string; arch: string }): str
 program
   .command('link [token]')
   .description('Link this gateway to your AgentDraw account')
-  .option('--relay <url>', 'Relay HTTP URL', 'http://localhost:8080')
+  .option('--relay <url>', 'Relay HTTP URL', DEFAULT_RELAY)
   .option('--name <name>', 'Gateway display name')
   .action(async (token: string | undefined, opts: { relay: string; name?: string }) => {
     if (token) {
@@ -969,7 +970,7 @@ async function deviceAuthFlow(opts: { relay: string; name?: string }): Promise<v
   console.log(`  Config saved to: ${CONFIG_FILE}`);
   console.log();
   console.log('  To start tunneling, run:');
-  console.log(`    openclaw-relay connect --token ${result.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
+  console.log(`    agentdraw connect --token ${result.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
   console.log();
 }
 
@@ -1012,7 +1013,7 @@ async function redeemLinkTokenFlow(token: string, opts: { relay: string; name?: 
     console.log(`  Config saved to: ${CONFIG_FILE}`);
     console.log();
     console.log('  To start tunneling, run:');
-    console.log(`    openclaw-relay connect --token ${data.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
+    console.log(`    agentdraw connect --token ${data.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
     console.log();
   } catch (err) {
     console.error(`  Failed to redeem link token: ${err instanceof Error ? err.message : err}`);
@@ -1030,7 +1031,7 @@ program
   .action(async () => {
     const config = loadConfig();
     if (!config) {
-      console.log('\n  Not linked. Run `openclaw-relay link` to get started.\n');
+      console.log('\n  Not linked. Run `agentdraw link` to get started.\n');
       process.exit(0);
     }
 
@@ -1079,7 +1080,7 @@ program
   .action(async () => {
     const config = loadConfig();
     if (!config) {
-      console.log('\n  Not linked. Run `openclaw-relay link` to get started.\n');
+      console.log('\n  Not linked. Run `agentdraw link` to get started.\n');
       process.exit(0);
     }
 
