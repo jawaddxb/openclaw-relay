@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { createServer } from 'node:http';
-import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync } from 'node:fs';
 import { resolve, join, extname, normalize, sep, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, hostname, platform, arch } from 'node:os';
+import crypto from 'node:crypto';
 import { Command } from 'commander';
 import { GatewayClient } from './client.js';
 import { callOpenClawRpc, getOpenClawAgents } from './openclaw-rpc.js';
@@ -778,6 +779,321 @@ program
       );
       process.exit(1);
     }
+  });
+
+// ══════════════════════════════════════════════════════════════
+// Config file helpers (~/.agentdraw/config.json)
+// ══════════════════════════════════════════════════════════════
+
+const CONFIG_DIR = resolve(homedir(), '.agentdraw');
+const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+
+interface AgentDrawConfig {
+  relay_url: string;
+  gateway_id: string;
+  gateway_token: string;
+  user_email?: string;
+  machine_id?: string;
+  linked_at: string;
+}
+
+function loadConfig(): AgentDrawConfig | null {
+  try {
+    return JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function saveConfig(config: AgentDrawConfig): void {
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
+}
+
+function deleteConfig(): void {
+  try { unlinkSync(CONFIG_FILE); } catch { /* ignore */ }
+}
+
+function getMachineInfo(): { hostname: string; os: string; arch: string; version: string } {
+  return {
+    hostname: hostname(),
+    os: platform(),
+    arch: arch(),
+    version: '0.1.0',
+  };
+}
+
+function getMachineId(info: { hostname: string; os: string; arch: string }): string {
+  return crypto.createHash('sha256').update(`${info.hostname}|${info.os}|${info.arch}`).digest('hex');
+}
+
+// ══════════════════════════════════════════════════════════════
+// link command — Device auth + QR code flow
+// ══════════════════════════════════════════════════════════════
+
+program
+  .command('link [token]')
+  .description('Link this gateway to your AgentDraw account')
+  .option('--relay <url>', 'Relay HTTP URL', 'http://localhost:8080')
+  .option('--name <name>', 'Gateway display name')
+  .action(async (token: string | undefined, opts: { relay: string; name?: string }) => {
+    if (token) {
+      // Link token redemption flow
+      await redeemLinkTokenFlow(token, opts);
+    } else {
+      // Device auth flow (interactive)
+      await deviceAuthFlow(opts);
+    }
+  });
+
+async function deviceAuthFlow(opts: { relay: string; name?: string }): Promise<void> {
+  const relayUrl = opts.relay;
+  const machineInfo = getMachineInfo();
+
+  console.log('\n  AgentDraw Gateway Link');
+  console.log('  ' + '─'.repeat(44));
+  console.log();
+  console.log('  Starting device authorization...');
+
+  // Step 1: Initiate device auth
+  let deviceRes: {
+    device_code: string;
+    user_code: string;
+    verification_url: string;
+    expires_at: number;
+    interval: number;
+  };
+
+  try {
+    const res = await fetch(`${relayUrl}/api/auth/device`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_info: machineInfo }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status}: ${body}`);
+    }
+    deviceRes = await res.json() as typeof deviceRes;
+  } catch (err) {
+    console.error(`  Failed to start device auth: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
+
+  // Step 2: Show QR code + text instructions
+  const verificationUrl = `${deviceRes.verification_url}?c=${deviceRes.user_code}`;
+
+  try {
+    const qrcode = await import('qrcode-terminal');
+    qrcode.default.generate(verificationUrl, { small: true }, (qr: string) => {
+      console.log();
+      for (const line of qr.split('\n')) {
+        console.log('    ' + line);
+      }
+    });
+  } catch {
+    console.log(`  QR link: ${verificationUrl}`);
+  }
+
+  console.log();
+  console.log(`  Or visit:  ${deviceRes.verification_url}`);
+  console.log(`  Enter code: ${deviceRes.user_code}`);
+  console.log();
+  console.log('  Waiting for authorization...');
+
+  // Step 3: Poll for token
+  const interval = (deviceRes.interval || 5) * 1000;
+  const expiresAt = deviceRes.expires_at;
+
+  const result = await new Promise<{ gateway_token: string; gateway_id: string } | null>((resolve) => {
+    const poll = async () => {
+      if (Date.now() > expiresAt) {
+        console.log('\n  Device code expired.');
+        resolve(null);
+        return;
+      }
+
+      try {
+        const res = await fetch(`${relayUrl}/api/auth/device/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_code: deviceRes.device_code }),
+        });
+        const data = await res.json() as { status: string; gateway_token?: string; gateway_id?: string };
+
+        if (data.status === 'authorized' && data.gateway_token && data.gateway_id) {
+          resolve({ gateway_token: data.gateway_token, gateway_id: data.gateway_id });
+          return;
+        }
+
+        if (data.status === 'denied' || data.status === 'expired') {
+          console.log(`\n  Authorization ${data.status}.`);
+          resolve(null);
+          return;
+        }
+
+        // Still pending — poll again
+        setTimeout(poll, interval);
+      } catch {
+        // Network error — retry
+        setTimeout(poll, interval);
+      }
+    };
+
+    setTimeout(poll, interval);
+
+    // Handle Ctrl+C
+    process.on('SIGINT', () => {
+      console.log('\n  Cancelled.');
+      resolve(null);
+    });
+  });
+
+  if (!result) {
+    process.exit(1);
+  }
+
+  // Step 4: Save config
+  const config: AgentDrawConfig = {
+    relay_url: relayUrl,
+    gateway_id: result.gateway_id,
+    gateway_token: result.gateway_token,
+    machine_id: getMachineId(machineInfo),
+    linked_at: new Date().toISOString(),
+  };
+  saveConfig(config);
+
+  console.log();
+  console.log('  Gateway linked successfully!');
+  console.log(`  Gateway ID: ${result.gateway_id}`);
+  console.log(`  Config saved to: ${CONFIG_FILE}`);
+  console.log();
+  console.log('  To start tunneling, run:');
+  console.log(`    openclaw-relay connect --token ${result.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
+  console.log();
+}
+
+async function redeemLinkTokenFlow(token: string, opts: { relay: string; name?: string }): Promise<void> {
+  const relayUrl = opts.relay;
+  const machineInfo = getMachineInfo();
+
+  console.log('\n  Redeeming link token...');
+
+  try {
+    const res = await fetch(`${relayUrl}/api/link-tokens/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token,
+        gateway_name: opts.name || machineInfo.hostname,
+        machine_info: machineInfo,
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status}: ${body}`);
+    }
+
+    const data = await res.json() as { gateway_token: string; gateway_id: string };
+
+    const config: AgentDrawConfig = {
+      relay_url: relayUrl,
+      gateway_id: data.gateway_id,
+      gateway_token: data.gateway_token,
+      machine_id: getMachineId(machineInfo),
+      linked_at: new Date().toISOString(),
+    };
+    saveConfig(config);
+
+    console.log();
+    console.log('  Gateway linked successfully!');
+    console.log(`  Gateway ID: ${data.gateway_id}`);
+    console.log(`  Config saved to: ${CONFIG_FILE}`);
+    console.log();
+    console.log('  To start tunneling, run:');
+    console.log(`    openclaw-relay connect --token ${data.gateway_token} --upstream http://localhost:18789 --relay ${relayUrl.replace(/^http/, 'ws')}/v1/tunnel`);
+    console.log();
+  } catch (err) {
+    console.error(`  Failed to redeem link token: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// status command
+// ══════════════════════════════════════════════════════════════
+
+program
+  .command('status')
+  .description('Show current gateway link status')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config) {
+      console.log('\n  Not linked. Run `openclaw-relay link` to get started.\n');
+      process.exit(0);
+    }
+
+    console.log('\n  Gateway Status');
+    console.log('  ' + '─'.repeat(40));
+    console.log(`  Gateway ID:  ${config.gateway_id}`);
+    console.log(`  Relay:       ${config.relay_url}`);
+    console.log(`  Linked at:   ${config.linked_at}`);
+    if (config.user_email) {
+      console.log(`  User:        ${config.user_email}`);
+    }
+    if (config.machine_id) {
+      console.log(`  Machine ID:  ${config.machine_id.slice(0, 16)}...`);
+    }
+    console.log(`  Config:      ${CONFIG_FILE}`);
+    console.log();
+  });
+
+// ══════════════════════════════════════════════════════════════
+// unlink command
+// ══════════════════════════════════════════════════════════════
+
+program
+  .command('unlink')
+  .description('Unlink this gateway and remove stored credentials')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config) {
+      console.log('\n  Not linked.\n');
+      process.exit(0);
+    }
+
+    deleteConfig();
+    console.log('\n  Gateway unlinked.');
+    console.log(`  Removed config from ${CONFIG_FILE}`);
+    console.log('  Note: the gateway may still appear in your account until removed from the web dashboard.\n');
+  });
+
+// ══════════════════════════════════════════════════════════════
+// whoami command
+// ══════════════════════════════════════════════════════════════
+
+program
+  .command('whoami')
+  .description('Show linked account information')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config) {
+      console.log('\n  Not linked. Run `openclaw-relay link` to get started.\n');
+      process.exit(0);
+    }
+
+    console.log('\n  Account Info');
+    console.log('  ' + '─'.repeat(40));
+    if (config.user_email) {
+      console.log(`  Email:       ${config.user_email}`);
+    } else {
+      console.log('  Email:       (not available — linked via legacy token)');
+    }
+    console.log(`  Gateway ID:  ${config.gateway_id}`);
+    console.log(`  Relay:       ${config.relay_url}`);
+    console.log(`  Linked:      ${config.linked_at}`);
+    console.log();
   });
 
 program.parse();
