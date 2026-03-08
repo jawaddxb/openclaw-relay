@@ -273,12 +273,25 @@ program
       const http = gw?.http as Record<string, unknown> | undefined;
       const endpoints = http?.endpoints as Record<string, unknown> | undefined;
       const chatComp = endpoints?.chatCompletions as Record<string, unknown> | undefined;
-      if (!chatComp?.enabled) {
-        console.warn('  ⚠ Chat completions endpoint is NOT enabled in OpenClaw config.');
-        console.warn('    AgentDraw web chat requires it. Add to openclaw.json:');
-        console.warn('    { gateway: { http: { endpoints: { chatCompletions: { enabled: true } } } } }');
-        console.warn('    Then restart your OpenClaw gateway.');
-      } else {
+      if (!chatComp?.enabled && ocConfigPath) {
+        // Auto-enable chat completions
+        try {
+          if (!gw) ocConfig.gateway = {};
+          const gwObj = ocConfig.gateway as Record<string, unknown>;
+          if (!gwObj.http) gwObj.http = {};
+          const httpObj = gwObj.http as Record<string, unknown>;
+          if (!httpObj.endpoints) httpObj.endpoints = {};
+          const epObj = httpObj.endpoints as Record<string, unknown>;
+          if (!epObj.chatCompletions) epObj.chatCompletions = {};
+          (epObj.chatCompletions as Record<string, unknown>).enabled = true;
+          writeFileSync(ocConfigPath, JSON.stringify(ocConfig, null, 2) + '\n');
+          console.log('  ✓ Auto-enabled chat completions endpoint in OpenClaw config');
+          console.log('    Restart your OpenClaw gateway for it to take effect.');
+        } catch (e) {
+          console.warn('  ⚠ Chat completions endpoint is NOT enabled. Could not auto-fix:');
+          console.warn(`    ${(e as Error).message}`);
+        }
+      } else if (chatComp?.enabled) {
         console.log('  ✓ Chat completions endpoint enabled');
       }
     } else {
