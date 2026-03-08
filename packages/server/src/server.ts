@@ -304,7 +304,7 @@ export async function createRelayServer(
     return reply.send({
       device_code: result.deviceCode,
       user_code: result.userCode,
-      verification_url: 'https://agentdraw.io/link',
+      verification_url: process.env.WEB_APP_URL || 'https://agentdraw-web-production.up.railway.app/link',
       expires_at: result.expiresAt,
       interval: result.interval,
     });
@@ -388,7 +388,7 @@ export async function createRelayServer(
       token: result.token,
       id: result.id,
       expires_at: result.expiresAt,
-      command: `npx @agentdraw/cli link ${result.token}`,
+      command: `npx agentdraw link ${result.token}`,
     });
   });
 
