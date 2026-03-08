@@ -9246,12 +9246,40 @@ program2.command("connect").description("Connect gateway to relay server").optio
       res.end(JSON.stringify({ error: e instanceof Error ? e.message : "unknown" }));
     }
   });
-  await new Promise((resolve2) => sidecar.listen(sidecarPort, "127.0.0.1", resolve2));
-  console.log(`  Sidecar running on http://127.0.0.1:${sidecarPort}`);
+  let actualSidecarPort = sidecarPort;
+  const startSidecar = () => new Promise((resolve2, reject) => {
+    sidecar.once("error", async (err) => {
+      if (err.code === "EADDRINUSE") {
+        try {
+          const { execSync } = await import("node:child_process");
+          const pids = execSync(`lsof -ti :${actualSidecarPort}`, { encoding: "utf-8" }).trim();
+          if (pids) {
+            for (const pid of pids.split("\n")) {
+              try {
+                process.kill(parseInt(pid), "SIGKILL");
+              } catch {
+              }
+            }
+            await new Promise((r) => setTimeout(r, 500));
+            sidecar.listen(actualSidecarPort, "127.0.0.1", () => resolve2(actualSidecarPort));
+            return;
+          }
+        } catch {
+        }
+        actualSidecarPort++;
+        sidecar.listen(actualSidecarPort, "127.0.0.1", () => resolve2(actualSidecarPort));
+      } else {
+        reject(err);
+      }
+    });
+    sidecar.listen(actualSidecarPort, "127.0.0.1", () => resolve2(actualSidecarPort));
+  });
+  actualSidecarPort = await startSidecar();
+  console.log(`  Sidecar running on http://127.0.0.1:${actualSidecarPort}`);
   const client = new GatewayClient({
     relayUrl: opts.relay,
     token: opts.token,
-    upstream: `http://127.0.0.1:${sidecarPort}`,
+    upstream: `http://127.0.0.1:${actualSidecarPort}`,
     upstreamToken: ocToken,
     // Inject OpenClaw gateway auth on tunneled requests
     gatewayName: opts.name

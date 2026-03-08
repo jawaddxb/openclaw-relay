@@ -787,13 +787,41 @@ program
       }
     });
 
-    await new Promise<void>((resolve) => sidecar.listen(sidecarPort, '127.0.0.1', resolve));
-    console.log(`  Sidecar running on http://127.0.0.1:${sidecarPort}`);
+    // Try to bind sidecar port — auto-kill stale process or find next available
+    let actualSidecarPort = sidecarPort;
+    const startSidecar = (): Promise<number> => new Promise((resolve, reject) => {
+      sidecar.once('error', async (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          // Try to kill whatever's using the port
+          try {
+            const { execSync } = await import('node:child_process');
+            const pids = execSync(`lsof -ti :${actualSidecarPort}`, { encoding: 'utf-8' }).trim();
+            if (pids) {
+              for (const pid of pids.split('\n')) {
+                try { process.kill(parseInt(pid), 'SIGKILL'); } catch { /* already dead */ }
+              }
+              // Wait a moment and retry same port
+              await new Promise(r => setTimeout(r, 500));
+              sidecar.listen(actualSidecarPort, '127.0.0.1', () => resolve(actualSidecarPort));
+              return;
+            }
+          } catch { /* lsof failed, try next port */ }
+          // Fallback: try next port
+          actualSidecarPort++;
+          sidecar.listen(actualSidecarPort, '127.0.0.1', () => resolve(actualSidecarPort));
+        } else {
+          reject(err);
+        }
+      });
+      sidecar.listen(actualSidecarPort, '127.0.0.1', () => resolve(actualSidecarPort));
+    });
+    actualSidecarPort = await startSidecar();
+    console.log(`  Sidecar running on http://127.0.0.1:${actualSidecarPort}`);
 
     const client = new GatewayClient({
       relayUrl: opts.relay,
       token: opts.token,
-      upstream: `http://127.0.0.1:${sidecarPort}`,
+      upstream: `http://127.0.0.1:${actualSidecarPort}`,
       upstreamToken: ocToken, // Inject OpenClaw gateway auth on tunneled requests
       gatewayName: opts.name,
     });
