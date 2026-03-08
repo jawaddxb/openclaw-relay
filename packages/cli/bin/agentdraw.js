@@ -8689,10 +8689,121 @@ program2.command("connect").description("Connect gateway to relay server").optio
       process.exit(1);
     }
   }
+  const ocConfigPaths = [
+    (0, import_node_path.join)((0, import_node_os.homedir)(), ".openclaw", "openclaw.json"),
+    (0, import_node_path.join)((0, import_node_os.homedir)(), ".openclaw", "config.json")
+  ];
+  let ocConfig = null;
+  let ocConfigPath = null;
+  for (const p of ocConfigPaths) {
+    try {
+      ocConfig = JSON.parse((0, import_node_fs.readFileSync)(p, "utf-8"));
+      ocConfigPath = p;
+      break;
+    } catch {
+    }
+  }
+  let ocToken = opts.openclawToken;
+  if (!ocToken && ocConfig) {
+    const gw = ocConfig.gateway;
+    const auth = gw?.auth;
+    if (auth?.token && typeof auth.token === "string") {
+      ocToken = auth.token;
+      console.log("  \u2713 Auto-detected OpenClaw gateway token");
+    } else if (auth?.mode === "password" && typeof auth.password === "string") {
+      ocToken = auth.password;
+      console.log("  \u2713 Auto-detected OpenClaw gateway password");
+    }
+  }
+  if (!ocToken) {
+    ocToken = process.env.OPENCLAW_GATEWAY_TOKEN || process.env.OPENCLAW_GATEWAY_PASSWORD;
+    if (ocToken) console.log("  \u2713 Using OpenClaw token from environment");
+  }
   const upstreamUrl = opts.upstream;
+  if (opts.upstream === "http://localhost:18789" && ocConfig) {
+    const gw = ocConfig.gateway;
+    const port = gw?.port;
+    if (port && typeof port === "number" && port !== 18789) {
+      const detectedUrl = `http://localhost:${port}`;
+      console.log(`  \u2713 Auto-detected gateway port: ${port}`);
+      opts.upstream = detectedUrl;
+    }
+  }
+  let agentIdentity = null;
+  if (ocConfig) {
+    const agents = ocConfig.agents;
+    const defaults = agents?.defaults;
+    const workspace = defaults?.workspace || (0, import_node_path.join)((0, import_node_os.homedir)(), ".openclaw", "workspace");
+    const resolvedWorkspace = workspace.replace(/^~/, (0, import_node_os.homedir)());
+    try {
+      const identityPath = (0, import_node_path.join)(resolvedWorkspace, "IDENTITY.md");
+      const identityContent = (0, import_node_fs.readFileSync)(identityPath, "utf-8");
+      const nameMatch = identityContent.match(/\*\*Name:\*\*\s*(.+)/i);
+      const emojiMatch = identityContent.match(/\*\*Emoji:\*\*\s*(.+)/i);
+      const vibeMatch = identityContent.match(/\*\*Vibe:\*\*\s*(.+)/i);
+      agentIdentity = {
+        name: nameMatch?.[1]?.trim(),
+        emoji: emojiMatch?.[1]?.trim(),
+        description: vibeMatch?.[1]?.trim()
+      };
+      if (agentIdentity.name) {
+        console.log(`  \u2713 Agent identity: ${agentIdentity.emoji || "\u{1F916}"} ${agentIdentity.name}`);
+      }
+    } catch {
+    }
+    if (!agentIdentity?.name) {
+      try {
+        const soulPath = (0, import_node_path.join)(resolvedWorkspace, "SOUL.md");
+        const soulContent = (0, import_node_fs.readFileSync)(soulPath, "utf-8");
+        const nameMatch = soulContent.match(/^#\s+.*?(?:Who I Am|Soul)/im);
+        const iAmMatch = soulContent.match(/I am (\w+)/i);
+        if (iAmMatch) {
+          agentIdentity = { name: iAmMatch[1], emoji: "\u{1F916}" };
+          console.log(`  \u2713 Agent identity (from SOUL.md): ${agentIdentity.name}`);
+        }
+      } catch {
+      }
+    }
+  }
+  const actualUpstream = opts.upstream || upstreamUrl;
+  try {
+    const healthRes = await fetch(`${actualUpstream}/status`, {
+      headers: ocToken ? { "Authorization": `Bearer ${ocToken}` } : {},
+      signal: AbortSignal.timeout(3e3)
+    });
+    if (healthRes.ok) {
+      console.log("  \u2713 OpenClaw gateway is running");
+    } else if (healthRes.status === 401) {
+      if (!ocToken) {
+        console.warn("  \u26A0 OpenClaw requires auth but no token found. Pass --openclaw-token or set OPENCLAW_GATEWAY_TOKEN");
+      } else {
+        console.warn("  \u26A0 OpenClaw auth token rejected \u2014 check gateway.auth.token in openclaw.json");
+      }
+    }
+  } catch {
+    console.warn(`  \u26A0 Cannot reach OpenClaw at ${actualUpstream} \u2014 is the gateway running?`);
+  }
+  if (ocConfig) {
+    const gw = ocConfig.gateway;
+    const http = gw?.http;
+    const endpoints = http?.endpoints;
+    const chatComp = endpoints?.chatCompletions;
+    if (!chatComp?.enabled) {
+      console.warn("  \u26A0 Chat completions endpoint is NOT enabled in OpenClaw config.");
+      console.warn("    AgentDraw web chat requires it. Add to openclaw.json:");
+      console.warn("    { gateway: { http: { endpoints: { chatCompletions: { enabled: true } } } } }");
+      console.warn("    Then restart your OpenClaw gateway.");
+    } else {
+      console.log("  \u2713 Chat completions endpoint enabled");
+    }
+  } else {
+    console.warn(`  \u26A0 OpenClaw config not found at ${ocConfigPaths.join(" or ")}`);
+    console.warn("    Cannot verify chat completions or gateway auth. Proceeding anyway.");
+  }
+  console.log("");
   const sidecarPort = parseInt(opts.sidecarPort, 10);
-  const ocWsUrl = upstreamUrl.replace(/^http/, "ws");
-  const ocToken = opts.openclawToken;
+  const ocHttpUrl = opts.upstream || upstreamUrl;
+  const ocWsUrl = ocHttpUrl.replace(/^http/, "ws");
   const sidecar = (0, import_node_http.createServer)(async (req, res) => {
     const url = req.url ?? "/";
     res.setHeader("Content-Type", "application/json");
@@ -9136,9 +9247,27 @@ program2.command("connect").description("Connect gateway to relay server").optio
   client.on("connected", ({ gatewayId }) => {
     console.log(`
   Connected to relay as gateway: ${gatewayId}`);
-    console.log(`  Forwarding to: ${upstreamUrl} (via sidecar)`);
+    console.log(`  Forwarding to: ${actualUpstream} (via sidecar)`);
     console.log(`  Press Ctrl+C to disconnect.
 `);
+    if (agentIdentity?.name) {
+      const relayHttpUrl = opts.relay.replace(/^wss?/, "https").replace(/\/v1\/tunnel$/, "");
+      fetch(`${relayHttpUrl}/api/gateways/${gatewayId}/identity`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${opts.token}`
+        },
+        body: JSON.stringify({
+          agentName: agentIdentity.name,
+          agentEmoji: agentIdentity.emoji,
+          agentDescription: agentIdentity.description
+        })
+      }).then((r) => {
+        if (r.ok) console.log(`  \u2713 Agent identity synced to relay: ${agentIdentity.name}`);
+      }).catch(() => {
+      });
+    }
   });
   client.on("disconnected", ({ reason }) => {
     console.log(`  Disconnected: ${reason}`);

@@ -568,6 +568,9 @@ export async function createRelayServer(
       machineInfo: gw.machine_info ? JSON.parse(gw.machine_info) : null,
       lastSeen: gw.last_seen,
       createdAt: gw.created_at,
+      agentName: gw.agent_name || null,
+      agentEmoji: gw.agent_emoji || null,
+      agentDescription: gw.agent_description || null,
     }));
 
     return reply.send({ gateways });
@@ -614,6 +617,42 @@ export async function createRelayServer(
   // ══════════════════════════════════════════════════════════════
   // EXISTING ROUTES (backwards compat)
   // ══════════════════════════════════════════════════════════════
+
+  // ── PUT /api/gateways/:id/identity — Update agent identity (from gateway CLI) ──
+
+  app.put<{
+    Params: { id: string };
+    Body: { agentName?: string; agentEmoji?: string; agentDescription?: string };
+  }>('/api/gateways/:id/identity', async (request, reply) => {
+    // Accept either JWT (user) or gateway token (CLI pushing identity)
+    const auth = request.headers.authorization;
+    if (!auth?.startsWith('Bearer ')) {
+      return reply.status(401).send({ error: 'Missing authorization' });
+    }
+    const token = auth.slice(7);
+
+    // Try gateway token auth (CLI sends its own gw_live_ token)
+    const gwInfo = db.validateAnyGatewayToken(token);
+    if (gwInfo && gwInfo.id === request.params.id) {
+      // Gateway is updating its own identity — allowed
+    } else {
+      // Try JWT auth
+      const jwtAuth = requireAuth(request, reply);
+      if (!jwtAuth) return;
+      // Verify user owns this gateway
+      const gw = db.findUserGateway(request.params.id, jwtAuth.sub);
+      if (!gw) return reply.status(404).send({ error: 'Gateway not found' });
+    }
+
+    const { agentName, agentEmoji, agentDescription } = request.body ?? {};
+    db.updateAgentIdentity(request.params.id, {
+      agentName: agentName || undefined,
+      agentEmoji: agentEmoji || undefined,
+      agentDescription: agentDescription || undefined,
+    });
+
+    return reply.send({ ok: true });
+  });
 
   // ── Pairing API ──────────────────────────────────────────────
 

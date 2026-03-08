@@ -53,6 +53,9 @@ export interface UserGatewayRow {
   status: string;
   last_seen: number | null;
   created_at: number;
+  agent_name: string | null;
+  agent_emoji: string | null;
+  agent_description: string | null;
 }
 
 export interface DeviceAuthRow {
@@ -228,6 +231,9 @@ export class RelayDB {
         created_at      INTEGER NOT NULL
       );
 
+      -- Agent identity columns (added after initial schema)
+      -- ALTER TABLE handled below via try/catch for existing DBs
+
       CREATE TABLE IF NOT EXISTS device_auth (
         device_code     TEXT PRIMARY KEY,
         user_code       TEXT UNIQUE NOT NULL,
@@ -290,6 +296,16 @@ export class RelayDB {
       CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user ON email_verification_tokens(user_id);
       CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id);
     `);
+
+    // Migrations for existing databases — add agent identity columns
+    const migrations = [
+      'ALTER TABLE user_gateways ADD COLUMN agent_name TEXT',
+      'ALTER TABLE user_gateways ADD COLUMN agent_emoji TEXT',
+      'ALTER TABLE user_gateways ADD COLUMN agent_description TEXT',
+    ];
+    for (const sql of migrations) {
+      try { this.db.exec(sql); } catch { /* column already exists */ }
+    }
   }
 
   // ── Existing methods (backwards compat) ──────────────────────
@@ -817,6 +833,34 @@ export class RelayDB {
     this.db
       .prepare('UPDATE user_gateways SET status = ?, last_seen = ? WHERE id = ?')
       .run(status, Date.now(), gatewayId);
+  }
+
+  updateAgentIdentity(
+    gatewayId: string,
+    identity: { agentName?: string; agentEmoji?: string; agentDescription?: string },
+  ): void {
+    const parts: string[] = [];
+    const values: unknown[] = [];
+    if (identity.agentName !== undefined) {
+      parts.push('agent_name = ?');
+      values.push(identity.agentName);
+      // Also update the gateway display name to match agent name
+      parts.push('name = ?');
+      values.push(identity.agentName);
+    }
+    if (identity.agentEmoji !== undefined) {
+      parts.push('agent_emoji = ?');
+      values.push(identity.agentEmoji);
+    }
+    if (identity.agentDescription !== undefined) {
+      parts.push('agent_description = ?');
+      values.push(identity.agentDescription);
+    }
+    if (parts.length === 0) return;
+    values.push(gatewayId);
+    this.db
+      .prepare(`UPDATE user_gateways SET ${parts.join(', ')} WHERE id = ?`)
+      .run(...values);
   }
 
   // ── Email Verification ──────────────────────────────────────

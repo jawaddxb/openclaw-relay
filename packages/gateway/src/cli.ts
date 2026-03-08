@@ -158,12 +158,141 @@ program
         process.exit(1);
       }
     }
+
+    // ── Auto-detect OpenClaw configuration ──────────────────────
+    const ocConfigPaths = [
+      join(homedir(), '.openclaw', 'openclaw.json'),
+      join(homedir(), '.openclaw', 'config.json'),
+    ];
+
+    let ocConfig: Record<string, unknown> | null = null;
+    let ocConfigPath: string | null = null;
+    for (const p of ocConfigPaths) {
+      try {
+        ocConfig = JSON.parse(readFileSync(p, 'utf-8'));
+        ocConfigPath = p;
+        break;
+      } catch { /* try next */ }
+    }
+
+    // Auto-detect OpenClaw gateway token
+    let ocToken = opts.openclawToken as string | undefined;
+    if (!ocToken && ocConfig) {
+      const gw = ocConfig.gateway as Record<string, unknown> | undefined;
+      const auth = gw?.auth as Record<string, unknown> | undefined;
+      if (auth?.token && typeof auth.token === 'string') {
+        ocToken = auth.token;
+        console.log('  ✓ Auto-detected OpenClaw gateway token');
+      } else if (auth?.mode === 'password' && typeof auth.password === 'string') {
+        ocToken = auth.password;
+        console.log('  ✓ Auto-detected OpenClaw gateway password');
+      }
+    }
+    // Also check env var
+    if (!ocToken) {
+      ocToken = process.env.OPENCLAW_GATEWAY_TOKEN || process.env.OPENCLAW_GATEWAY_PASSWORD;
+      if (ocToken) console.log('  ✓ Using OpenClaw token from environment');
+    }
+
+    // Auto-detect upstream port
     const upstreamUrl = opts.upstream as string;
+    if (opts.upstream === 'http://localhost:18789' && ocConfig) {
+      const gw = ocConfig.gateway as Record<string, unknown> | undefined;
+      const port = gw?.port;
+      if (port && typeof port === 'number' && port !== 18789) {
+        const detectedUrl = `http://localhost:${port}`;
+        console.log(`  ✓ Auto-detected gateway port: ${port}`);
+        // Override — but opts.upstream is default so we can safely replace
+        (opts as Record<string, unknown>).upstream = detectedUrl;
+      }
+    }
+
+    // Auto-detect agent identity
+    let agentIdentity: { name?: string; emoji?: string; description?: string } | null = null;
+    if (ocConfig) {
+      const agents = ocConfig.agents as Record<string, unknown> | undefined;
+      const defaults = agents?.defaults as Record<string, unknown> | undefined;
+      const workspace = (defaults?.workspace as string) || join(homedir(), '.openclaw', 'workspace');
+      const resolvedWorkspace = workspace.replace(/^~/, homedir());
+
+      // Read IDENTITY.md
+      try {
+        const identityPath = join(resolvedWorkspace, 'IDENTITY.md');
+        const identityContent = readFileSync(identityPath, 'utf-8');
+        const nameMatch = identityContent.match(/\*\*Name:\*\*\s*(.+)/i);
+        const emojiMatch = identityContent.match(/\*\*Emoji:\*\*\s*(.+)/i);
+        const vibeMatch = identityContent.match(/\*\*Vibe:\*\*\s*(.+)/i);
+        agentIdentity = {
+          name: nameMatch?.[1]?.trim(),
+          emoji: emojiMatch?.[1]?.trim(),
+          description: vibeMatch?.[1]?.trim(),
+        };
+        if (agentIdentity.name) {
+          console.log(`  ✓ Agent identity: ${agentIdentity.emoji || '🤖'} ${agentIdentity.name}`);
+        }
+      } catch { /* no identity file */ }
+
+      // Fallback: read SOUL.md for name
+      if (!agentIdentity?.name) {
+        try {
+          const soulPath = join(resolvedWorkspace, 'SOUL.md');
+          const soulContent = readFileSync(soulPath, 'utf-8');
+          const nameMatch = soulContent.match(/^#\s+.*?(?:Who I Am|Soul)/im);
+          const iAmMatch = soulContent.match(/I am (\w+)/i);
+          if (iAmMatch) {
+            agentIdentity = { name: iAmMatch[1], emoji: '🤖' };
+            console.log(`  ✓ Agent identity (from SOUL.md): ${agentIdentity.name}`);
+          }
+        } catch { /* no soul file */ }
+      }
+    }
+
+    // Health check: verify OpenClaw is running
+    const actualUpstream = (opts as Record<string, unknown>).upstream as string || upstreamUrl;
+    try {
+      const healthRes = await fetch(`${actualUpstream}/status`, {
+        headers: ocToken ? { 'Authorization': `Bearer ${ocToken}` } : {},
+        signal: AbortSignal.timeout(3000),
+      });
+      if (healthRes.ok) {
+        console.log('  ✓ OpenClaw gateway is running');
+      } else if (healthRes.status === 401) {
+        if (!ocToken) {
+          console.warn('  ⚠ OpenClaw requires auth but no token found. Pass --openclaw-token or set OPENCLAW_GATEWAY_TOKEN');
+        } else {
+          console.warn('  ⚠ OpenClaw auth token rejected — check gateway.auth.token in openclaw.json');
+        }
+      }
+    } catch {
+      console.warn(`  ⚠ Cannot reach OpenClaw at ${actualUpstream} — is the gateway running?`);
+    }
+
+    // Check if chat completions endpoint is enabled
+    if (ocConfig) {
+      const gw = ocConfig.gateway as Record<string, unknown> | undefined;
+      const http = gw?.http as Record<string, unknown> | undefined;
+      const endpoints = http?.endpoints as Record<string, unknown> | undefined;
+      const chatComp = endpoints?.chatCompletions as Record<string, unknown> | undefined;
+      if (!chatComp?.enabled) {
+        console.warn('  ⚠ Chat completions endpoint is NOT enabled in OpenClaw config.');
+        console.warn('    AgentDraw web chat requires it. Add to openclaw.json:');
+        console.warn('    { gateway: { http: { endpoints: { chatCompletions: { enabled: true } } } } }');
+        console.warn('    Then restart your OpenClaw gateway.');
+      } else {
+        console.log('  ✓ Chat completions endpoint enabled');
+      }
+    } else {
+      console.warn(`  ⚠ OpenClaw config not found at ${ocConfigPaths.join(' or ')}`);
+      console.warn('    Cannot verify chat completions or gateway auth. Proceeding anyway.');
+    }
+
+    console.log(''); // blank line before connection output
+
     const sidecarPort = parseInt(opts.sidecarPort, 10);
 
     // Build WS URL for OpenClaw RPC (same host as upstream, ws:// protocol)
-    const ocWsUrl = upstreamUrl.replace(/^http/, 'ws');
-    const ocToken = opts.openclawToken as string | undefined;
+    const ocHttpUrl = (opts as Record<string, unknown>).upstream as string || upstreamUrl;
+    const ocWsUrl = ocHttpUrl.replace(/^http/, 'ws');
 
     // Start a JSON sidecar HTTP server that translates REST → OpenClaw WS RPC
     const sidecar = createServer(async (req, res) => {
@@ -658,8 +787,27 @@ program
 
     client.on('connected', ({ gatewayId }) => {
       console.log(`\n  Connected to relay as gateway: ${gatewayId}`);
-      console.log(`  Forwarding to: ${upstreamUrl} (via sidecar)`);
+      console.log(`  Forwarding to: ${actualUpstream} (via sidecar)`);
       console.log(`  Press Ctrl+C to disconnect.\n`);
+
+      // Push agent identity to relay (best-effort, non-blocking)
+      if (agentIdentity?.name) {
+        const relayHttpUrl = opts.relay.replace(/^wss?/, 'https').replace(/\/v1\/tunnel$/, '');
+        fetch(`${relayHttpUrl}/api/gateways/${gatewayId}/identity`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${opts.token}`,
+          },
+          body: JSON.stringify({
+            agentName: agentIdentity.name,
+            agentEmoji: agentIdentity.emoji,
+            agentDescription: agentIdentity.description,
+          }),
+        }).then(r => {
+          if (r.ok) console.log(`  ✓ Agent identity synced to relay: ${agentIdentity!.name}`);
+        }).catch(() => { /* non-critical */ });
+      }
     });
 
     client.on('disconnected', ({ reason }) => {
