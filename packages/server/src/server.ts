@@ -22,6 +22,8 @@ export interface RelayServerOptions {
   host?: string;
   dbPath?: string;
   heartbeatMs?: number;
+  heartbeatTimeoutMultiplier?: number;
+  gracePeriodMs?: number;
 }
 
 export interface RelayServer {
@@ -43,10 +45,12 @@ export async function createRelayServer(
     host = '0.0.0.0',
     dbPath = './relay.db',
     heartbeatMs = 30_000,
+    heartbeatTimeoutMultiplier,
+    gracePeriodMs,
   } = options;
 
   const db = new RelayDB(dbPath);
-  const hub = new WebSocketHub(heartbeatMs);
+  const hub = new WebSocketHub(heartbeatMs, { heartbeatTimeoutMultiplier, gracePeriodMs });
 
   const app = Fastify({ logger: true });
   await app.register(fastifyCors, {
@@ -129,6 +133,14 @@ export async function createRelayServer(
 
   hub.on('gateway:connected', (info: { id: string; name: string }) => {
     db.updateGatewayStatus(info.id, 'online');
+  });
+
+  hub.on('gateway:reconnected', (info: { id: string; name: string }) => {
+    db.updateGatewayStatus(info.id, 'online');
+  });
+
+  hub.on('gateway:reconnecting', (_info: { id: string }) => {
+    // Keep DB status as 'online' during grace period — don't flash offline
   });
 
   hub.on('gateway:disconnected', (info: { id: string; reason: string }) => {
@@ -779,6 +791,14 @@ export async function createRelayServer(
     const accept = (request.headers.accept ?? '').toLowerCase();
     const isSSE = accept.includes('text/event-stream');
 
+    // Per-path request timeouts
+    let timeoutMs = 60_000;
+    if (path === '/status' || path === '/api/health' || path.startsWith('/health')) {
+      timeoutMs = 15_000;
+    } else if (path.includes('/chat/completions') || path.includes('/messages')) {
+      timeoutMs = 180_000;
+    }
+
     if (isSSE) {
       // SSE streaming response
       try {
@@ -815,6 +835,7 @@ export async function createRelayServer(
               reply.raw.end();
             },
           },
+          timeoutMs,
         );
       } catch (err) {
         const message =
@@ -824,12 +845,17 @@ export async function createRelayServer(
     } else {
       // Regular request/response
       try {
-        const response = await hub.forwardRequest(gatewayId, {
-          method: request.method,
-          path,
-          headers,
-          body: request.body != null ? JSON.stringify(request.body) : undefined,
-        });
+        const response = await hub.forwardRequest(
+          gatewayId,
+          {
+            method: request.method,
+            path,
+            headers,
+            body: request.body != null ? JSON.stringify(request.body) : undefined,
+          },
+          undefined,
+          timeoutMs,
+        );
 
         reply.status(response.status).headers(response.headers).send(response.body);
       } catch (err) {
@@ -864,6 +890,14 @@ export async function createRelayServer(
 
   hub.on('gateway:connected', (info: { id: string; name: string }) => {
     broadcastEvent(info.id, 'gateway:status', { connected: true, name: info.name });
+  });
+
+  hub.on('gateway:reconnected', (info: { id: string; name: string }) => {
+    broadcastEvent(info.id, 'gateway:status', { connected: true, reconnected: true, name: info.name });
+  });
+
+  hub.on('gateway:reconnecting', (info: { id: string }) => {
+    broadcastEvent(info.id, 'gateway:status', { connected: true, reconnecting: true });
   });
 
   hub.on('gateway:disconnected', (info: { id: string; reason: string }) => {

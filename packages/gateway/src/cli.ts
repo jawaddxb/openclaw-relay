@@ -902,13 +902,20 @@ program
       process.exit(0);
     });
 
-    try {
-      await client.connect();
-    } catch (err) {
-      console.error(
-        `Failed to connect: ${err instanceof Error ? err.message : err}`,
-      );
-      process.exit(1);
+    // Retry loop — keep trying to establish initial connection
+    const maxRetryDelay = 30_000;
+    let retryDelay = 2_000;
+    while (true) {
+      try {
+        await client.connect();
+        break; // Connected successfully
+      } catch (err) {
+        console.error(
+          `  Connection failed: ${err instanceof Error ? err.message : err}. Retrying in ${Math.round(retryDelay / 1000)}s...`,
+        );
+        await new Promise(r => setTimeout(r, retryDelay));
+        retryDelay = Math.min(retryDelay * 1.5, maxRetryDelay);
+      }
     }
   });
 

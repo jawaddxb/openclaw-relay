@@ -23,14 +23,17 @@ import type {
 export interface GatewayConnection {
   id: string;
   name: string;
-  ws: WebSocket;
+  ws: WebSocket | null;
   decoder: FrameDecoder;
   connectedAt: Date;
   lastPingAt: Date;
+  /** Set when WS closes; gateway kept in map during grace period */
+  disconnectedAt: number | null;
 }
 
 export interface PendingChannel {
   channelId: number;
+  gatewayId: string;
   resolve: (value: ChannelResponse) => void;
   reject: (reason: Error) => void;
   headReceived: boolean;
@@ -52,6 +55,8 @@ export interface ChannelResponse {
 export interface HubEvents {
   'gateway:connected': { id: string; name: string };
   'gateway:disconnected': { id: string; reason: string };
+  'gateway:reconnecting': { id: string };
+  'gateway:reconnected': { id: string; name: string };
   'request': { gatewayId: string; method: string; path: string };
 }
 
@@ -61,10 +66,14 @@ export class WebSocketHub extends EventEmitter {
   private nextChannelId = 1;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private heartbeatMs: number;
+  private heartbeatTimeoutMultiplier: number;
+  private gracePeriodMs: number;
 
-  constructor(heartbeatMs = 30_000) {
+  constructor(heartbeatMs = 30_000, options?: { heartbeatTimeoutMultiplier?: number; gracePeriodMs?: number }) {
     super();
     this.heartbeatMs = heartbeatMs;
+    this.heartbeatTimeoutMultiplier = options?.heartbeatTimeoutMultiplier ?? 3;
+    this.gracePeriodMs = options?.gracePeriodMs ?? 45_000;
   }
 
   start(): void {
@@ -77,7 +86,7 @@ export class WebSocketHub extends EventEmitter {
       this.pingInterval = null;
     }
     for (const gw of this.gateways.values()) {
-      gw.ws.close(1001, 'Server shutting down');
+      gw.ws?.close(1001, 'Server shutting down');
     }
     this.gateways.clear();
   }
@@ -90,6 +99,8 @@ export class WebSocketHub extends EventEmitter {
     const decoder = new FrameDecoder();
     let authenticated = false;
     let gatewayId: string | null = null;
+    /** Set to true when this socket is replaced by a new connection (code 4003) */
+    let replacedByReconnect = false;
 
     const timeout = setTimeout(() => {
       if (!authenticated) {
@@ -123,9 +134,11 @@ export class WebSocketHub extends EventEmitter {
             authenticated = true;
             gatewayId = info.id;
 
-            // Remove old connection if reconnecting
             const existing = this.gateways.get(gatewayId);
-            if (existing) {
+            const wasDisconnected = existing?.disconnectedAt != null;
+
+            // Close old socket if still open (mark it so its close handler doesn't emit disconnect)
+            if (existing?.ws) {
               existing.ws.close(4003, 'Replaced by new connection');
             }
 
@@ -136,6 +149,7 @@ export class WebSocketHub extends EventEmitter {
               decoder,
               connectedAt: new Date(),
               lastPingAt: new Date(),
+              disconnectedAt: null,
             };
             this.gateways.set(gatewayId, conn);
 
@@ -148,10 +162,18 @@ export class WebSocketHub extends EventEmitter {
               ),
             );
 
-            this.emit('gateway:connected', {
-              id: gatewayId,
-              name: conn.name,
-            });
+            if (wasDisconnected || existing) {
+              // Reconnected within grace period or replaced active socket — no disconnect event
+              this.emit('gateway:reconnected', {
+                id: gatewayId,
+                name: conn.name,
+              });
+            } else {
+              this.emit('gateway:connected', {
+                id: gatewayId,
+                name: conn.name,
+              });
+            }
           }
           return;
         }
@@ -160,27 +182,47 @@ export class WebSocketHub extends EventEmitter {
       }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code) => {
       clearTimeout(timeout);
-      if (gatewayId) {
-        this.gateways.delete(gatewayId);
-        this.emit('gateway:disconnected', {
-          id: gatewayId,
-          reason: 'connection closed',
-        });
+      if (!gatewayId) return;
+
+      // If this socket was replaced by a new connection, don't touch gateway state
+      if (code === 4003 || replacedByReconnect) {
+        replacedByReconnect = true;
+        return;
+      }
+
+      const conn = this.gateways.get(gatewayId);
+      // Only act if this is still the current connection's socket
+      if (conn && conn.ws === ws) {
+        // Enter grace period — keep entry but null the ws
+        conn.ws = null;
+        conn.disconnectedAt = Date.now();
+        this.emit('gateway:reconnecting', { id: gatewayId });
       }
     });
 
     ws.on('error', () => {
       clearTimeout(timeout);
-      if (gatewayId) {
-        this.gateways.delete(gatewayId);
-        this.emit('gateway:disconnected', {
-          id: gatewayId,
-          reason: 'connection error',
-        });
+      if (!gatewayId) return;
+
+      const conn = this.gateways.get(gatewayId);
+      if (conn && conn.ws === ws) {
+        conn.ws = null;
+        conn.disconnectedAt = Date.now();
+        this.emit('gateway:reconnecting', { id: gatewayId });
       }
     });
+  }
+
+  /** Reject all pending channels belonging to a gateway */
+  private rejectPendingChannels(gatewayId: string): void {
+    for (const [channelId, channel] of this.channels) {
+      if (channel.gatewayId === gatewayId) {
+        channel.reject(new Error('Gateway disconnected'));
+        this.channels.delete(channelId);
+      }
+    }
   }
 
   private handleGatewayFrame(gatewayId: string, frame: Frame): void {
@@ -192,7 +234,7 @@ export class WebSocketHub extends EventEmitter {
     }
 
     if (frame.type === FrameType.PING) {
-      if (gw) {
+      if (gw?.ws) {
         gw.ws.send(encodeFrame(pongFrame(frame.sequence)));
       }
       return;
@@ -294,9 +336,10 @@ export class WebSocketHub extends EventEmitter {
       onBodyChunk?: (data: Buffer) => void;
       onHead?: (head: ResponseHeadPayload) => void;
     },
+    timeoutMs = 60_000,
   ): Promise<ChannelResponse> {
     const gw = this.gateways.get(gatewayId);
-    if (!gw) {
+    if (!gw || !gw.ws) {
       throw new Error('Gateway not connected');
     }
 
@@ -306,6 +349,7 @@ export class WebSocketHub extends EventEmitter {
     return new Promise<ChannelResponse>((resolve, reject) => {
       const channel: PendingChannel = {
         channelId,
+        gatewayId,
         resolve,
         reject,
         headReceived: false,
@@ -317,11 +361,10 @@ export class WebSocketHub extends EventEmitter {
 
       this.channels.set(channelId, channel);
 
-      // Timeout after 60s
       const timer = setTimeout(() => {
         this.channels.delete(channelId);
         reject(new Error('Request timeout'));
-      }, 60_000);
+      }, timeoutMs);
 
       const origResolve = resolve;
       const origReject = reject;
@@ -338,7 +381,7 @@ export class WebSocketHub extends EventEmitter {
       };
 
       const frame = requestFrame(channelId, request);
-      gw.ws.send(encodeFrame(frame));
+      gw.ws!.send(encodeFrame(frame));
 
       this.emit('request', {
         gatewayId,
@@ -349,6 +392,12 @@ export class WebSocketHub extends EventEmitter {
   }
 
   isGatewayConnected(gatewayId: string): boolean {
+    const gw = this.gateways.get(gatewayId);
+    return gw != null && gw.ws != null;
+  }
+
+  /** Returns true if the gateway exists in the map (connected or in grace period) */
+  isGatewayAlive(gatewayId: string): boolean {
     return this.gateways.has(gatewayId);
   }
 
@@ -363,14 +412,27 @@ export class WebSocketHub extends EventEmitter {
   private sendPings(): void {
     const now = Date.now();
     for (const [id, gw] of this.gateways) {
-      // If no pong in 2x heartbeat, disconnect
-      if (now - gw.lastPingAt.getTime() > this.heartbeatMs * 2) {
-        gw.ws.close(4004, 'Ping timeout');
-        this.gateways.delete(id);
-        this.emit('gateway:disconnected', { id, reason: 'ping timeout' });
+      // Gateway in grace period (ws is null, waiting for reconnect)
+      if (gw.disconnectedAt != null) {
+        if (now - gw.disconnectedAt > this.gracePeriodMs) {
+          // Grace period expired — actually disconnect
+          this.gateways.delete(id);
+          this.rejectPendingChannels(id);
+          this.emit('gateway:disconnected', { id, reason: 'reconnect timeout' });
+        }
         continue;
       }
-      gw.ws.send(encodeFrame(pingFrame()));
+
+      // Active connection — check ping timeout
+      if (now - gw.lastPingAt.getTime() > this.heartbeatMs * this.heartbeatTimeoutMultiplier) {
+        gw.ws?.close(4004, 'Ping timeout');
+        // Enter grace period instead of immediate delete
+        gw.ws = null;
+        gw.disconnectedAt = Date.now();
+        this.emit('gateway:reconnecting', { id });
+        continue;
+      }
+      gw.ws?.send(encodeFrame(pingFrame()));
     }
   }
 }
