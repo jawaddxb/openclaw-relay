@@ -51,9 +51,9 @@ function serveWorkspace(url: string): { status: number; headers: Record<string, 
   const parsed = new URL(url, 'http://localhost');
   const pathname = parsed.pathname;
 
-  // Directory listing: /api/workspace/?dir=memory
-  if (pathname === '/api/workspace/' || pathname === '/api/workspace') {
-    const dirParam = parsed.searchParams.get('dir');
+  // Directory listing: /api/workspace/?dir=memory  OR  /api/workspace/list?path=memory
+  if (pathname === '/api/workspace/' || pathname === '/api/workspace' || pathname === '/api/workspace/list') {
+    const dirParam = parsed.searchParams.get('dir') || parsed.searchParams.get('path') || '';
     const safeDirName = dirParam ? normalize(dirParam).replace(/^(\.\.[\\/])+/, '') : '';
     const dirPath = safeDirName ? join(WORKSPACE_DIR, safeDirName) : WORKSPACE_DIR;
 
@@ -73,6 +73,21 @@ function serveWorkspace(url: string): { status: number; headers: Record<string, 
       return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(files) };
     } catch {
       return { status: 404, headers: {}, body: JSON.stringify({ error: 'Directory not found' }) };
+    }
+  }
+
+  // File read by query param: /api/workspace/read?path=MEMORY.md
+  if (pathname === '/api/workspace/read') {
+    const pathParam = parsed.searchParams.get('path');
+    if (!pathParam) return { status: 400, headers: {}, body: JSON.stringify({ error: 'Missing path parameter' }) };
+    const filePath = resolve(WORKSPACE_DIR, pathParam);
+    if (!isPathSafe(filePath)) return { status: 403, headers: {}, body: JSON.stringify({ error: 'Path traversal blocked' }) };
+    try {
+      const content = readFileSync(filePath, 'utf8');
+      const ct = extname(filePath) === '.json' ? 'application/json' : 'text/plain; charset=utf-8';
+      return { status: 200, headers: { 'content-type': ct }, body: content };
+    } catch {
+      return { status: 404, headers: {}, body: JSON.stringify({ error: 'File not found' }) };
     }
   }
 
