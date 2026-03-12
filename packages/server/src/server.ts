@@ -1033,6 +1033,25 @@ export async function createRelayServer(
       }
     }
 
+    if (method === 'health') {
+      // Quick health check — just verify gateway is connected and responsive
+      try {
+        const response = await hub.forwardRequest(gatewayId, {
+          method: 'GET',
+          path: '/api/health',
+          headers: {},
+        }, undefined, 15_000);
+        const text = response.body.toString('utf8');
+        try {
+          return reply.send({ result: JSON.parse(text) });
+        } catch {
+          return reply.send({ result: { ok: true, raw: text } });
+        }
+      } catch (err) {
+        return reply.status(502).send({ error: { message: String(err) } });
+      }
+    }
+
     return reply.status(400).send({ error: 'Unknown RPC method' });
   });
 
