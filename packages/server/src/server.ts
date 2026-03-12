@@ -771,7 +771,10 @@ export async function createRelayServer(
       });
     }
 
-    const path = '/' + (request.params['*'] || '');
+    // Include query string when forwarding to gateway
+    const rawPath = '/' + (request.params['*'] || '');
+    const qs = request.url.includes('?') ? request.url.slice(request.url.indexOf('?')) : '';
+    const path = rawPath + qs;
     const headers: Record<string, string> = {};
     for (const [key, val] of Object.entries(request.headers)) {
       if (
